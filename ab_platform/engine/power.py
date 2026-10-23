@@ -1,82 +1,222 @@
-"""Power & Sample Size Engine — расчёт выборки, MDE и длительности."""
-
-from __future__ import annotations
-
 import math
 from dataclasses import dataclass
-from enum import Enum
-
+from typing import Dict, List, Optional
+import numpy as np
 from scipy import stats
 
 
-class MetricKind(str, Enum):
-    BINARY = "binary"
-    CONTINUOUS = "continuous"
-    RATIO = "ratio"
-
-
-@dataclass(frozen=True)
-class PowerConfig:
-    alpha: float = 0.05
-    power: float = 0.80
-    two_sided: bool = True
-
-
-@dataclass(frozen=True)
-class PowerResult:
-    sample_size_per_group: int
+@dataclass
+class SampleSizeResult:
+    n_per_variant: int
     total_sample_size: int
-    mde: float
-    duration_days: float
-    notes: str = ""
+    estimated_days: int
+    mde_relative: float
+    mde_absolute: float
+    effective_variance: float
+    variance_reduction_pct: float
+    is_feasible_under_5_weeks: bool
+    recommendation: str
+    tradeoff_table: List[Dict[str, float]]
+
+
+@dataclass
+class SwitchbackPowerResult:
+    required_total_cells: int
+    required_time_windows_per_cluster: int
+    mde_relative: float
+    mde_absolute: float
+    macro_inflation_factor_lambda: float
+    recommend_cluster_robust_cr2: bool
+    warning_message: Optional[str]
 
 
 class PowerAndSampleSizeEngine:
-    def __init__(self, config: PowerConfig | None = None):
-        self.config = config or PowerConfig()
+    """
+    Математическое ядро для расчета выборки, MDE, длительности,
+    эффекта сжатия дисперсии (CUPED/CUPAC) и дизайна Switchback-тестов.
+    """
 
-    def _z_values(self) -> tuple[float, float]:
-        alpha = self.config.alpha
-        if self.config.two_sided:
-            z_alpha = stats.norm.ppf(1 - alpha / 2)
+    @staticmethod
+    def compute_ratio_delta_variance(
+        y_values: np.ndarray,
+        x_values: np.ndarray,
+    ) -> float:
+        """
+        Вычисляет эффективную поюзерную дисперсию Ratio-метрики R = sum(Y) / sum(X)
+        через разложение Тейлора 1-го порядка (Дельта-метод) с учетом внутрипользовательской корреляции.
+        """
+        if len(y_values) != len(x_values):
+            raise ValueError("Длины массивов числителя Y и знаменателя X должны совпадать.")
+
+        mean_x = float(np.mean(x_values))
+        if mean_x <= 0:
+            raise ValueError("Среднее значение знаменателя X должно быть строго положительным.")
+
+        mean_y = float(np.mean(y_values))
+        ratio_est = mean_y / mean_x
+
+        var_y = float(np.var(y_values, ddof=1))
+        var_x = float(np.var(x_values, ddof=1))
+        cov_yx = float(np.cov(y_values, x_values, ddof=1)[0, 1])
+
+        # Формула Дельта-метода: Var(Y - R*X) / (mean_X)^2
+        delta_var = (var_y - 2.0 * ratio_est * cov_yx + (ratio_est ** 2) * var_x) / (mean_x ** 2)
+        return max(delta_var, 1e-12)
+
+    @classmethod
+    def calculate_sample_size(
+        cls,
+        baseline_mean: float,
+        mde_relative: float,
+        metric_variance: Optional[float] = None,
+        is_binary: bool = False,
+        alpha: float = 0.05,
+        power: float = 0.80,
+        daily_traffic: int = 10000,
+        num_variants: int = 2,
+        treatment_allocation_ratio: float = 0.5,
+        pre_post_correlation_r: float = 0.0,
+    ) -> SampleSizeResult:
+        """
+        Универсальный расчет размера выборки и длительности теста с учетом:
+        - Неравного сплита (например, 90/10 или 50/50)
+        - Сжатия дисперсии CUPED: Var_cuped = Var * (1 - r^2)
+        - Эвристик выполнимости (порог 5 недель / 35 дней)
+        """
+        if is_binary:
+            if not (0.0 < baseline_mean < 1.0):
+                raise ValueError("Для бинарной метрики (конверсии) baseline_mean должен быть в интервале (0, 1).")
+            raw_variance = baseline_mean * (1.0 - baseline_mean)
         else:
-            z_alpha = stats.norm.ppf(1 - alpha)
-        z_beta = stats.norm.ppf(self.config.power)
-        return z_alpha, z_beta
+            if metric_variance is None or metric_variance <= 0:
+                raise ValueError("Для непрерывной или Ratio-метрики необходимо передать metric_variance > 0.")
+            raw_variance = metric_variance
 
-    def binary(self, baseline_rate: float, mde: float, daily_users: int) -> PowerResult:
-        z_alpha, z_beta = self._z_values()
-        p1 = baseline_rate
-        p2 = baseline_rate + mde
-        pooled = (p1 + p2) / 2.0
-        numerator = (z_alpha * math.sqrt(2 * pooled * (1 - pooled)) + z_beta * math.sqrt(p1 * (1 - p1) + p2 * (1 - p2))) ** 2
-        denominator = (p2 - p1) ** 2
-        n_per_group = math.ceil(numerator / denominator)
-        total = n_per_group * 2
-        duration = math.ceil(total / daily_users)
-        return PowerResult(sample_size_per_group=n_per_group, total_sample_size=total, mde=mde, duration_days=float(duration), notes=f"Baseline={p1:.4f}, Treatment={p2:.4f}")
+        if not (0.0 <= abs(pre_post_correlation_r) < 1.0):
+            raise ValueError("Корреляция ковариаты pre_post_correlation_r должна быть в пределах [0, 1).")
 
-    def continuous(self, mean: float, std: float, mde: float, daily_users: int) -> PowerResult:
-        z_alpha, z_beta = self._z_values()
-        effect_size = mde / std
-        n_per_group = math.ceil(2 * ((z_alpha + z_beta) / effect_size) ** 2)
-        total = n_per_group * 2
-        duration = math.ceil(total / daily_users)
-        return PowerResult(sample_size_per_group=n_per_group, total_sample_size=total, mde=mde, duration_days=float(duration), notes=f"Mean={mean:.2f}, Std={std:.2f}, Cohen's d={effect_size:.4f}")
+        # Применение сжатия дисперсии CUPED: Var_adj = Var * (1 - r^2)
+        variance_reduction_pct = (pre_post_correlation_r ** 2) * 100.0
+        effective_variance = raw_variance * (1.0 - pre_post_correlation_r ** 2)
 
-    def ratio_delta_method(self, numerator_mean: float, numerator_var: float, denominator_mean: float, denominator_var: float, covariance: float, mde_relative: float, daily_users: int) -> PowerResult:
-        z_alpha, z_beta = self._z_values()
-        d = denominator_mean
-        ratio_var = numerator_var / d**2 - 2 * numerator_mean * covariance / d**3 + (numerator_mean / d)**2 * denominator_var / d**2
-        ratio_std = math.sqrt(max(ratio_var, 1e-12))
-        ratio_mean = numerator_mean / d
-        effect_size = (mde_relative * ratio_mean) / ratio_std
-        n_per_group = math.ceil(2 * ((z_alpha + z_beta) / effect_size) ** 2)
-        total = n_per_group * 2
-        duration = math.ceil(total / daily_users)
-        return PowerResult(sample_size_per_group=n_per_group, total_sample_size=total, mde=mde_relative, duration_days=float(duration), notes=f"Delta-method ratio: mean={ratio_mean:.4f}, std={ratio_std:.4f}")
+        mde_abs = baseline_mean * mde_relative
+        z_alpha = float(stats.norm.ppf(1.0 - alpha / 2.0))
+        z_beta = float(stats.norm.ppf(power))
 
-    def cuped_adjustment(self, base_n: int, correlation_with_covariate: float) -> int:
-        rho_sq = correlation_with_covariate ** 2
-        adjusted = math.ceil(base_n * (1 - rho_sq))
-        return max(adjusted, 1)
+        # Коэффициент аллокации трафика k = p_treat / p_control
+        # Для 50/50 множитель равен (1/0.5 + 1/0.5) = 4, т.е. классические 2 * sigma^2 на группу
+        p_t = treatment_allocation_ratio
+        p_c = 1.0 - p_t if num_variants == 2 else (1.0 - p_t) / (num_variants - 1)
+        allocation_multiplier = (1.0 / p_t) + (1.0 / p_c)
+
+        total_n_float = ((z_alpha + z_beta) ** 2) * effective_variance * allocation_multiplier / (mde_abs ** 2)
+        total_sample_size = int(math.ceil(total_n_float))
+        n_per_variant = int(math.ceil(total_sample_size / num_variants))
+
+        raw_days = math.ceil(total_sample_size / max(daily_traffic, 1))
+        # Округление вверх до минимум 7 дней (защита от недельной сезонности)
+        estimated_days = max(7, int(raw_days))
+        is_feasible = estimated_days <= 35
+
+        # Построение таблицы компромиссов (Power Trade-off Table) для ИИ-ассистента
+        tradeoff_table = []
+        for candidate_days in (7, 14, 21, 28, 35):
+            available_n = candidate_days * daily_traffic
+            achievable_mde_abs = (z_alpha + z_beta) * math.sqrt(
+                (effective_variance * allocation_multiplier) / max(available_n, 2)
+            )
+            achievable_mde_rel = achievable_mde_abs / baseline_mean
+            tradeoff_table.append({
+                "duration_days": candidate_days,
+                "total_users": available_n,
+                "min_detectable_effect_rel_pct": round(achievable_mde_rel * 100.0, 2),
+                "min_detectable_effect_abs": round(achievable_mde_abs, 5),
+            })
+
+        if is_feasible:
+            recommendation = (
+                f"Дизайн корректен: тест наберет мощность {int(power*100)}% за {estimated_days} дн. "
+                f"(выборка: {total_sample_size:,} юзеров, сжатие дисперсии CUPED: {variance_reduction_pct:.1f}%)."
+            )
+        else:
+            mde_14d = tradeoff_table[1]["min_detectable_effect_rel_pct"]
+            recommendation = (
+                f"ВНИМАНИЕ: При текущем трафике ({daily_traffic:,}/день) для детекции MDE={mde_relative*100:.1f}% "
+                f"потребуется {estimated_days} дн. (>5 недель). Классический A/B неэффективен. "
+                f"Рекомендация ИИ: 1) Подключите ковариаты CUPED/CUPAC; 2) Тестируйте более радикальные изменения "
+                f"(за 14 дней можно засечь эффект от {mde_14d}%); 3) Используйте Multi-Armed Bandit."
+            )
+
+        return SampleSizeResult(
+            n_per_variant=n_per_variant,
+            total_sample_size=total_sample_size,
+            estimated_days=estimated_days,
+            mde_relative=mde_relative,
+            mde_absolute=mde_abs,
+            effective_variance=effective_variance,
+            variance_reduction_pct=round(variance_reduction_pct, 2),
+            is_feasible_under_5_weeks=is_feasible,
+            recommendation=recommendation,
+            tradeoff_table=tradeoff_table,
+        )
+
+    @staticmethod
+    def calculate_switchback_mde(
+        num_clusters_j: int,
+        num_time_windows_h: int,
+        mean_cell_size_n: float,
+        cell_size_cv: float,
+        baseline_mean: float,
+        total_variance: float,
+        within_cell_variance_share: float = 0.85,
+        macro_cell_variance_share: float = 0.15,
+        alpha: float = 0.05,
+        power: float = 0.80,
+    ) -> SwitchbackPowerResult:
+        """
+        Точный расчет MDE и параметров для Switchback и кластерных тестов (DoorDash methodology).
+        Учитывает как внутриячеечный шум (S_res / n_bar), так и межкластерную/временную
+        макро-дисперсию S_macro * (1/n_bar + 1 + cv^2).
+        """
+        total_cells_b = num_clusters_j * num_time_windows_h
+        if total_cells_b < 4:
+            raise ValueError("Общее число ячеек (J кластеров * H окон времени) должно быть >= 4.")
+
+        cv_sq = cell_size_cv ** 2
+        # Фактор макро-инфляции для обучения Power-Optimal CUPAC: lambda = n_bar * (1 + cv^2)
+        macro_lambda = mean_cell_size_n * (1.0 + cv_sq)
+
+        z_alpha = float(stats.norm.ppf(1.0 - alpha / 2.0))
+        z_beta = float(stats.norm.ppf(power))
+
+        # Декомпозиция дисперсии ячейки: [S_res / n_bar + S_macro * (1/n_bar + 1 + cv^2)]
+        effective_cell_var_factor = (
+            (within_cell_variance_share / mean_cell_size_n)
+            + macro_cell_variance_share * ((1.0 / mean_cell_size_n) + 1.0 + cv_sq)
+        )
+
+        mde_abs = (z_alpha + z_beta) * math.sqrt(
+            (4.0 * total_variance / total_cells_b) * effective_cell_var_factor
+        )
+        mde_rel = mde_abs / baseline_mean
+
+        # Если мало ячеек (<=10) или высокий дисбаланс размеров кластеров (cv >= 2.0),
+        # Дельта-метод 1-го порядка завышает мощность — нужен переход на CR2 и t-квантили
+        recommend_cr2 = (total_cells_b <= 10) or (cell_size_cv >= 2.0)
+        warning_msg = None
+        if recommend_cr2:
+            warning_msg = (
+                f"Обнаружен высокий дисбаланс размеров ячеек (CV={cell_size_cv:.2f}) или малое число ячеек "
+                f"(B={total_cells_b}). Платформа автоматически переключит оценку дисперсии с обычного "
+                "Дельта-метода на кластерно-робастный оцениватель (CR2) с поправкой степеней свободы."
+            )
+
+        return SwitchbackPowerResult(
+            required_total_cells=total_cells_b,
+            required_time_windows_per_cluster=num_time_windows_h,
+            mde_relative=round(mde_rel, 5),
+            mde_absolute=round(mde_abs, 5),
+            macro_inflation_factor_lambda=round(macro_lambda, 2),
+            recommend_cluster_robust_cr2=recommend_cr2,
+            warning_message=warning_msg,
+        )
