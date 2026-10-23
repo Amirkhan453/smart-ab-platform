@@ -54,7 +54,7 @@ class MetricDefinition(BaseModel):
     )
     expected_direction: Direction = Direction.INCREASE
     winsorize_percentile: Optional[float] = Field(
-        0.999, ge=0.90, le=1.0, description="Порог винзоризации выбросов (например, 0.995 или 0.999)"
+        0.995, ge=0.90, le=1.0, description="Порог винзоризации выбросов (например, 0.995 или 0.999)"
     )
 
     @model_validator(mode="after")

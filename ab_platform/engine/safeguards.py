@@ -10,7 +10,7 @@ class ExperimentSafeguardEngine:
     - SPRT (Sequential Probability Ratio Test) для детекции SRM без проблемы подглядывания (peeking)
     - PSI (Population Stability Index) для проверки пред-экспериментального баланса сегментов
     - Двухэтапная диагностика SRM (Assigned stage vs Triggered stage)
-    - Проверка Guardrail-метрик для автоматической остановки (Auto-Revert)
+    - Проверка Guardrail-метрик для автоматической остановки (Auto-Revert) с поддержкой нулевого бейзлайна
     """
 
     @staticmethod
@@ -32,10 +32,8 @@ class ExperimentSafeguardEngine:
 
         p0 = expected_treatment_ratio
         obs_p = n_treatment / total_n
-        # Выбираем направление альтернативной гипотезы с учетом зоны толерантности delta
         p1 = min(0.999, p0 + tolerance_delta) if obs_p >= p0 else max(0.001, p0 - tolerance_delta)
 
-        # Логарифм отношения правдоподобия Бернулли: log(L(H1) / L(H0))
         log_lambda = (
             n_treatment * math.log(p1 / p0)
             + n_control * math.log((1.0 - p1) / (1.0 - p0))
@@ -54,7 +52,6 @@ class ExperimentSafeguardEngine:
             status = "continue_monitoring"
             srm_detected = False
 
-        # Дополнительно считаем классический Chi-square p-value для справочного отчета
         expected_t = total_n * p0
         expected_c = total_n * (1.0 - p0)
         chi2_stat = ((n_treatment - expected_t) ** 2) / expected_t + ((n_control - expected_c) ** 2) / expected_c
@@ -112,10 +109,7 @@ class ExperimentSafeguardEngine:
     def calculate_psi(
         control_dist: np.ndarray, treatment_dist: np.ndarray, epsilon: float = 1e-6
     ) -> dict:
-        """
-        Расчет Population Stability Index (PSI) для валидации качества рандомизации по когортам/сегментам:
-        PSI = sum( (p_t - p_c) * ln(p_t / p_c) ). Если PSI > 0.10 — сильный перекос сегментов.
-        """
+        """Расчет Population Stability Index (PSI) для валидации качества рандомизации по когортам/сегментам."""
         c = np.asarray(control_dist, dtype=float)
         t = np.asarray(treatment_dist, dtype=float)
 
@@ -140,15 +134,21 @@ class ExperimentSafeguardEngine:
     ) -> dict:
         """
         Проверяет, пробила ли защитная метрика (Guardrail) допустимый порог деградации.
-        При пробое возвращает команду немедленной остановки эксперимента (Auto-Revert).
+        Корректно обрабатывает случай baseline_control == 0.0 (например, 0 ошибок в контроле).
         """
-        if baseline_control == 0:
-            raise ValueError("Базовое значение контрольной группы не может быть нулевым.")
+        if abs(baseline_control) < 1e-12:
+            if abs(treatment_value) < 1e-12:
+                rel_change = 0.0
+                degradation = 0.0
+            else:
+                rel_change = float(treatment_value - baseline_control)
+                degradation = -rel_change if higher_is_better else rel_change
+        else:
+            rel_change = (treatment_value - baseline_control) / abs(baseline_control)
+            degradation = -rel_change if higher_is_better else rel_change
 
-        rel_change = (treatment_value - baseline_control) / abs(baseline_control)
-        degradation = -rel_change if higher_is_better else rel_change
-
-        is_breached = bool((degradation > max_allowed_degradation_rel) and (p_value < alpha_guardrail))
+        clean_pval = 1.0 if np.isnan(p_value) else float(p_value)
+        is_breached = bool((degradation > max_allowed_degradation_rel) and (clean_pval < alpha_guardrail))
         return {
             "relative_change_pct": round(rel_change * 100.0, 3),
             "degradation_pct": round(degradation * 100.0, 3),
