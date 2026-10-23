@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import List, Optional
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -108,7 +108,7 @@ class ExperimentPassport(BaseModel):
     experiment_id: str
     test_key: str = Field(..., description="Уникальный ключ фичи для ортогонального хэширования")
     layer_id: str = Field("default_layer", description="Слой (Plane) для изоляции пересекающихся тестов")
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
     # 1. Структурированная гипотеза
     hypothesis_statement: str = Field(
