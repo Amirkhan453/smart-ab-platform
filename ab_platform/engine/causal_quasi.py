@@ -1,5 +1,5 @@
 import math
-from typing import Dict, List
+from typing import List, Optional
 import numpy as np
 import pandas as pd
 from scipy import optimize, stats
@@ -7,10 +7,10 @@ from scipy import optimize, stats
 
 class CausalAndMLDebiasingEngine:
     """
-    Модуль многомерного дебайасинга (LinkedIn methodology) и Квази-экспериментов (когда классический A/B невозможен):
-    - Многомерная ковариатная корректировка с раздельными моделями в тесте и контроле (Count & Ratio metrics)
-    - Propensity Score Matching (PSM) и Doubly Robust (AIPW) оценка на исторических данных
-    - Difference-in-Differences (DiD) для оценки региональных и нерандомизированных запусков
+    Модуль многомерного дебайасинга (LinkedIn methodology) и Квази-экспериментов:
+    - Многомерная ковариатная корректировка с раздельными моделями в тесте и контроле
+    - Propensity Score Matching (PSM) и Doubly Robust (AIPW) с проверкой Common Support (Overlap)
+    - Difference-in-Differences (DiD) с гетероскедастично-робастными ошибками HC3 и проверкой пре-трендов
     """
 
     @staticmethod
@@ -21,10 +21,6 @@ class CausalAndMLDebiasingEngine:
         variant_col: str = "variant",
         alpha: float = 0.05,
     ) -> dict:
-        """
-        Многомерный дебайасинг по схеме LinkedIn (раздельные регрессии mu_T(X) и mu_C(X) на наборе ковариат):
-        Позволяет сжать дисперсию сильнее одномерного CUPED без внесения смещения.
-        """
         data = df.copy()
         X_all = data[feature_cols].to_numpy(dtype=float)
         X_mean = np.mean(X_all, axis=0)
@@ -72,13 +68,8 @@ class CausalAndMLDebiasingEngine:
         treatment_col: str,
         outcome_col: str,
         confounder_cols: List[str],
+        trim_bounds: tuple[float, float] = (0.05, 0.95),
     ) -> dict:
-        """
-        Оценка эффекта без рандомизации (Quasi-Experiment):
-        1) Оценивает Propensity Score e(X) = P(T=1 | X) через логистическую регрессию с L2-регуляризацией
-        2) Выполняет 1-to-1 Nearest Neighbor Matching по логиту propensity score (ATT)
-        3) Вычисляет Doubly Robust (AIPW) оценку среднего эффекта (ATE)
-        """
         X_raw = df[confounder_cols].to_numpy(dtype=float)
         X_std = (X_raw - np.mean(X_raw, axis=0)) / np.maximum(np.std(X_raw, axis=0), 1e-8)
         X_design = np.column_stack([np.ones(len(df)), X_std])
@@ -94,11 +85,16 @@ class CausalAndMLDebiasingEngine:
 
         opt = optimize.minimize(neg_log_likelihood, np.zeros(X_design.shape[1]), method="BFGS")
         logits = np.clip(X_design @ opt.x, -15.0, 15.0)
-        propensity = np.clip(1.0 / (1.0 + np.exp(-logits)), 0.02, 0.98)
+        raw_propensity = 1.0 / (1.0 + np.exp(-logits))
 
-        # 1-to-1 Nearest Neighbor Matching на логитах Propensity Score
+        in_support = (raw_propensity >= trim_bounds[0]) & (raw_propensity <= trim_bounds[1])
+        overlap_share = float(np.mean(in_support))
+        propensity = np.clip(raw_propensity, trim_bounds[0], trim_bounds[1])
+
         treated_idx = np.where(t == 1)[0]
         control_idx = np.where(t == 0)[0]
+        if len(treated_idx) < 2 or len(control_idx) < 2:
+            raise ValueError("Для PSM/AIPW необходимо минимум по 2 наблюдения в тестовой и контрольной группах.")
 
         treated_scores = logits[treated_idx]
         control_scores = logits[control_idx]
@@ -110,7 +106,6 @@ class CausalAndMLDebiasingEngine:
 
         att_psm = float(np.mean(y[treated_idx] - matched_control_outcomes))
 
-        # Doubly Robust (AIPW) оценка
         X_c = X_design[control_idx]
         X_t = X_design[treated_idx]
         beta_c = np.linalg.lstsq(X_c, y[control_idx], rcond=None)[0]
@@ -133,6 +128,8 @@ class CausalAndMLDebiasingEngine:
             "ate_doubly_robust": round(ate_dr, 4),
             "se_doubly_robust": round(se_dr, 4),
             "p_value_doubly_robust": p_val_dr,
+            "common_support_overlap_share": round(overlap_share, 4),
+            "overlap_warning": overlap_share < 0.70,
         }
 
     @staticmethod
@@ -141,33 +138,57 @@ class CausalAndMLDebiasingEngine:
         outcome_col: str,
         is_treated_group_col: str,
         is_post_period_col: str,
+        time_step_col: Optional[str] = None,
     ) -> dict:
-        """
-        Метод Двойных Разностей (Difference-in-Differences, DiD):
-        Оценивает интеракцию (Treated_Group x Post_Period) с проверкой стат. значимости.
-        """
         g = df[is_treated_group_col].to_numpy(dtype=float)
         post = df[is_post_period_col].to_numpy(dtype=float)
         inter = g * post
         y = df[outcome_col].to_numpy(dtype=float)
 
         X = np.column_stack([np.ones(len(df)), g, post, inter])
-        beta, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
+        n, k = X.shape
+        if n <= k:
+            raise ValueError("Недостаточно наблюдений для оценки модели DiD.")
+
+        xtx_inv = np.linalg.inv(X.T @ X)
+        beta = xtx_inv @ (X.T @ y)
         residuals = y - X @ beta
 
-        n, k = X.shape
-        sigma2 = float(np.sum(residuals ** 2) / max(n - k, 1))
-        cov_beta = sigma2 * np.linalg.inv(X.T @ X)
-        se_did = float(math.sqrt(max(cov_beta[3, 3], 1e-15)))
+        hat_diag = np.einsum("ij,jk,ik->i", X, xtx_inv, X)
+        hc3_weights = (residuals / np.maximum(1.0 - hat_diag, 1e-6)) ** 2
+        meat = (X * hc3_weights[:, None]).T @ X
+        cov_hc3 = xtx_inv @ meat @ xtx_inv
 
+        se_did = float(math.sqrt(max(cov_hc3[3, 3], 1e-15)))
         did_effect = float(beta[3])
         t_stat = did_effect / se_did
-        p_val = float(2.0 * (1.0 - stats.t.cdf(abs(t_stat), df=max(n - k, 1))))
+        p_val = float(2.0 * (1.0 - stats.t.cdf(abs(t_stat), df=n - k)))
+
+        parallel_trends_pval = None
+        parallel_trends_passed = True
+        if time_step_col and time_step_col in df.columns:
+            pre_df = df[df[is_post_period_col] == 0]
+            if len(pre_df) > 4:
+                g_pre = pre_df[is_treated_group_col].to_numpy(dtype=float)
+                t_pre = pre_df[time_step_col].to_numpy(dtype=float)
+                y_pre = pre_df[outcome_col].to_numpy(dtype=float)
+                X_pre = np.column_stack([np.ones(len(pre_df)), g_pre, t_pre, g_pre * t_pre])
+                b_pre, _, _, _ = np.linalg.lstsq(X_pre, y_pre, rcond=None)
+                res_pre = y_pre - X_pre @ b_pre
+                s2_pre = float(np.sum(res_pre ** 2) / max(len(pre_df) - 4, 1))
+                cov_pre = s2_pre * np.linalg.inv(X_pre.T @ X_pre + 1e-8 * np.eye(4))
+                se_slope_diff = math.sqrt(max(cov_pre[3, 3], 1e-15))
+                t_pre_stat = float(b_pre[3]) / se_slope_diff
+                parallel_trends_pval = float(2.0 * (1.0 - stats.t.cdf(abs(t_pre_stat), df=max(len(pre_df) - 4, 1))))
+                parallel_trends_passed = bool(parallel_trends_pval > 0.05)
 
         return {
             "did_treatment_effect": round(did_effect, 4),
             "standard_error": round(se_did, 4),
+            "se_type": "HC3_robust",
             "t_statistic": round(t_stat, 4),
             "p_value": p_val,
             "is_significant": bool(p_val < 0.05),
+            "parallel_trends_pvalue": parallel_trends_pval,
+            "parallel_trends_passed": parallel_trends_passed,
         }

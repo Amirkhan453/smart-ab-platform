@@ -1,14 +1,16 @@
 import hashlib
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Optional, Sequence
 import numpy as np
 from scipy import stats
+from ab_platform.schemas.passport import VariantAllocation
 
 
 @dataclass
 class AssignmentResult:
     user_id: str
     experiment_id: str
+    layer_id: str
     is_in_global_holdout: bool
     is_exposed: bool
     variant_id: str
@@ -17,22 +19,22 @@ class AssignmentResult:
 
 class DeterministicAssignmentEngine:
     """
-    Высокоскоростной детерминированный движок сплитования (по методологии Wish / Google / eBay):
-    - Использует 10 000 бакетов Z in [0, 9999] из 64-битного хэша MD5(experiment_id + user_id)
-    - Обеспечивает монотонный рампап (R_e = Z // 100) и независимый сплит вариантов (R_b = Z % 100)
-    - Поддерживает глобальный Holdout-слой (1-5% трафика) и слои взаимного исключения (Layers)
+    Детерминированный движок сплитования (10 000 бакетов):
+    - Строгая валидация процентов раскатки, сплита и слотов слоя
+    - Изоляция экспериментов внутри слоя (Layer / Plane Bucket Ranges)
+    - Поддержка как бинарного (A/B), так и многорукого (Multi-Arm A/B/C/n) распределения
     """
-
-    MAX_UINT64 = float(0xFFFFFFFFFFFFFFFF)
 
     @classmethod
     def _hash_to_10000_buckets(cls, salt_key: str, user_id: str) -> int:
+        if not user_id or not isinstance(user_id, str):
+            raise ValueError("user_id должен быть непустой строкой.")
+        if not salt_key or not isinstance(salt_key, str):
+            raise ValueError("salt_key должен быть непустой строкой.")
         concat_str = f"{salt_key}:{user_id}".encode("utf-8")
         digest = hashlib.md5(concat_str).digest()
-        # Берем первые 8 байт (64 бита) для равномерного отображения в [0, 9999]
         hash_64 = int.from_bytes(digest[:8], byteorder="big", signed=False)
-        z = int((hash_64 * 10000) // (0xFFFFFFFFFFFFFFFF + 1))
-        return z
+        return int((hash_64 * 10000) // (0xFFFFFFFFFFFFFFFF + 1))
 
     @classmethod
     def assign_user(
@@ -44,48 +46,84 @@ class DeterministicAssignmentEngine:
         global_holdout_pct: float = 0.0,
         holdout_salt: str = "global_holdout_v1",
         shared_hash_id: Optional[str] = None,
+        layer_id: str = "default_layer",
+        layer_slot_start: int = 0,
+        layer_slot_end: int = 10000,
+        variants: Optional[Sequence[VariantAllocation]] = None,
     ) -> AssignmentResult:
-        """
-        Назначает пользователя в вариант эксперимента:
-        1) Проверяет попадание в глобальный Holdout
-        2) Проверяет попадание в рампап эксперимента (R_e = Z // 100 < exposure_rate_pct)
-        3) Независимо распределяет в control или treatment (R_b = Z % 100 < control_split_pct)
-        """
+        if not (0.0 <= exposure_rate_pct <= 100.0):
+            raise ValueError(f"exposure_rate_pct должен быть в [0, 100], получено: {exposure_rate_pct}")
+        if not (0.0 < control_split_pct < 100.0) and variants is None:
+            raise ValueError(f"control_split_pct должен быть в (0, 100), получено: {control_split_pct}")
+        if not (0.0 <= global_holdout_pct < 100.0):
+            raise ValueError(f"global_holdout_pct должен быть в [0, 100), получено: {global_holdout_pct}")
+        if not (0 <= layer_slot_start < layer_slot_end <= 10000):
+            raise ValueError(f"Некорректный диапазон слотов слоя: [{layer_slot_start}, {layer_slot_end}).")
+
         if global_holdout_pct > 0.0:
             z_holdout = cls._hash_to_10000_buckets(holdout_salt, user_id)
             if (z_holdout / 100.0) < global_holdout_pct:
                 return AssignmentResult(
                     user_id=user_id,
                     experiment_id=experiment_id,
+                    layer_id=layer_id,
                     is_in_global_holdout=True,
                     is_exposed=False,
                     variant_id="holdout",
                     bucket_z=z_holdout,
                 )
 
+        if layer_slot_start > 0 or layer_slot_end < 10000:
+            z_layer = cls._hash_to_10000_buckets(f"layer:{layer_id}", user_id)
+            if not (layer_slot_start <= z_layer < layer_slot_end):
+                return AssignmentResult(
+                    user_id=user_id,
+                    experiment_id=experiment_id,
+                    layer_id=layer_id,
+                    is_in_global_holdout=False,
+                    is_exposed=False,
+                    variant_id="out_of_layer_slot",
+                    bucket_z=z_layer,
+                )
+
         effective_key = shared_hash_id if shared_hash_id else experiment_id
         z = cls._hash_to_10000_buckets(effective_key, user_id)
 
-        r_exposure = z // 100  # Диапазон [0..99] для монотонного рампапа
-        r_bucket = z % 100     # Независимый диапазон [0..99] для выбора варианта
+        r_exposure = z // 100
+        r_bucket = z % 100
 
         if r_exposure >= exposure_rate_pct:
             return AssignmentResult(
                 user_id=user_id,
                 experiment_id=experiment_id,
+                layer_id=layer_id,
                 is_in_global_holdout=False,
                 is_exposed=False,
                 variant_id="ignore",
                 bucket_z=z,
             )
 
-        variant = "control" if r_bucket < control_split_pct else "treatment"
+        if variants is not None:
+            total_pct = sum(v.traffic_percentage for v in variants)
+            if abs(total_pct - 100.0) > 1e-4:
+                raise ValueError(f"Сумма долей вариантов должна быть 100%, получено: {total_pct}")
+            cumulative = 0.0
+            chosen_variant = variants[-1].variant_id
+            for v in variants:
+                cumulative += v.traffic_percentage
+                if r_bucket < cumulative:
+                    chosen_variant = v.variant_id
+                    break
+        else:
+            chosen_variant = "control" if r_bucket < control_split_pct else "treatment"
+
         return AssignmentResult(
             user_id=user_id,
             experiment_id=experiment_id,
+            layer_id=layer_id,
             is_in_global_holdout=False,
             is_exposed=True,
-            variant_id=variant,
+            variant_id=chosen_variant,
             bucket_z=z,
         )
 
@@ -93,11 +131,8 @@ class DeterministicAssignmentEngine:
     def validate_orthogonality_and_uniformity(
         cls, exp_id_1: str, exp_id_2: str, n_sim_users: int = 20000
     ) -> dict:
-        """
-        Предпусковая проверка сплитования на синтетических юзерах:
-        1) Равномерность бакетов внутри эксперимента
-        2) Статистическая независимость (ортогональность) между двумя экспериментами (Chi2 test)
-        """
+        if n_sim_users < 100:
+            raise ValueError("n_sim_users должен быть >= 100.")
         contingency = np.zeros((2, 2), dtype=int)
         for i in range(n_sim_users):
             uid = f"sim_user_{i}"

@@ -1,0 +1,16 @@
+#!/bin/sh
+
+set -eu
+
+project_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$project_root"
+
+if [ -x ".venv/bin/python" ]; then
+    python_bin=".venv/bin/python"
+else
+    python_bin="python3"
+fi
+
+echo "Running tests before push..."
+"$python_bin" -m pytest -q
+echo "Tests passed. Push is allowed."

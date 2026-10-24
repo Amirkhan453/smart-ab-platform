@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Literal, Optional
 import numpy as np
 from scipy import stats
+from ab_platform.schemas.passport import Direction
 
 
 @dataclass
@@ -47,9 +48,8 @@ class SwitchbackPowerResult:
 class PowerAndSampleSizeEngine:
     """
     Математическое ядро расчета выборки, MDE, доверительных интервалов и длительности:
-    - Поддерживает точную формулу Эвана Миллера (evanmiller.org) с раздельной дисперсией H0 и H1
-    - Поддерживает Pooled-формулу и классическую формулу для непрерывных/Ratio метрик с CUPED
-    - Поддерживает расчет предельной ошибки (Margin of Error) и FPC (calculator.net)
+    - Строгая валидация всех входных параметров (baseline, traffic, alpha, power, allocation)
+    - Точная формула Эвана Миллера с учетом направления изменения (Direction.INCREASE / DECREASE)
     """
 
     @staticmethod
@@ -57,20 +57,23 @@ class PowerAndSampleSizeEngine:
         y_values: np.ndarray,
         x_values: np.ndarray,
     ) -> float:
-        """Вычисляет эффективную поюзерную дисперсию Ratio-метрики R = sum(Y)/sum(X) через Дельта-метод."""
-        if len(y_values) != len(x_values):
+        y = np.asarray(y_values, dtype=float)
+        x = np.asarray(x_values, dtype=float)
+        if len(y) < 2 or len(x) < 2:
+            raise ValueError("Для расчета Дельта-дисперсии необходимо минимум 2 наблюдения.")
+        if len(y) != len(x):
             raise ValueError("Длины массивов числителя Y и знаменателя X должны совпадать.")
 
-        mean_x = float(np.mean(x_values))
+        mean_x = float(np.mean(x))
         if mean_x <= 0:
             raise ValueError("Среднее значение знаменателя X должно быть строго положительным.")
 
-        mean_y = float(np.mean(y_values))
+        mean_y = float(np.mean(y))
         ratio_est = mean_y / mean_x
 
-        var_y = float(np.var(y_values, ddof=1))
-        var_x = float(np.var(x_values, ddof=1))
-        cov_yx = float(np.cov(y_values, x_values, ddof=1)[0, 1])
+        var_y = float(np.var(y, ddof=1))
+        var_x = float(np.var(x, ddof=1))
+        cov_yx = float(np.cov(y, x, ddof=1)[0, 1])
 
         delta_var = (var_y - 2.0 * ratio_est * cov_yx + (ratio_est ** 2) * var_x) / (mean_x ** 2)
         return max(delta_var, 1e-12)
@@ -84,6 +87,7 @@ class PowerAndSampleSizeEngine:
         metric_variance: Optional[float] = None,
         is_binary: bool = False,
         binary_method: Literal["evan_miller", "pooled", "baseline"] = "evan_miller",
+        expected_direction: Direction = Direction.INCREASE,
         alpha: float = 0.05,
         power: float = 0.80,
         daily_traffic: int = 10000,
@@ -92,12 +96,19 @@ class PowerAndSampleSizeEngine:
         pre_post_correlation_r: float = 0.0,
         finite_population_n: Optional[int] = None,
     ) -> SampleSizeResult:
-        """
-        Универсальный расчет выборки и длительности теста:
-        - При is_binary=True и binary_method='evan_miller' считает 1-в-1 с evanmiller.org
-        - Поддерживает как относительный (mde_relative), так и абсолютный (mde_absolute) эффект
-        - Поддерживает поправку на конечную генеральную совокупность (finite_population_n из calculator.net)
-        """
+        if baseline_mean <= 0.0:
+            raise ValueError(f"baseline_mean должен быть строго положительным (> 0), получено: {baseline_mean}")
+        if daily_traffic <= 0:
+            raise ValueError(f"daily_traffic должен быть > 0, получено: {daily_traffic}")
+        if num_variants < 2:
+            raise ValueError(f"num_variants должен быть >= 2, получено: {num_variants}")
+        if not (0.0 < treatment_allocation_ratio < 1.0):
+            raise ValueError("treatment_allocation_ratio должен быть строго в интервале (0, 1).")
+        if not (0.0 < alpha < 0.5):
+            raise ValueError("alpha должен быть в интервале (0, 0.5).")
+        if not (0.5 <= power < 1.0):
+            raise ValueError("power должен быть в интервале [0.5, 1.0).")
+
         if mde_relative is None and mde_absolute is None:
             raise ValueError("Необходимо передать либо mde_relative, либо mde_absolute.")
 
@@ -128,21 +139,21 @@ class PowerAndSampleSizeEngine:
             if not (0.0 < baseline_mean < 1.0):
                 raise ValueError("Для бинарной метрики baseline_mean должен быть в интервале (0, 1).")
             p1 = baseline_mean
+            p2 = (p1 + mde_abs) if expected_direction == Direction.INCREASE else (p1 - mde_abs)
+            if not (0.0 < p2 < 1.0):
+                raise ValueError(
+                    f"Целевая конверсия p2={p2:.4f} выходит за пределы (0, 1) при baseline={p1} и mde_abs={mde_abs}."
+                )
             raw_variance = p1 * (1.0 - p1)
             effective_variance = raw_variance * cuped_factor
 
             if binary_method == "evan_miller":
-                # Точный алгоритм Эвана Миллера: консервативный выбор p2 ближе к 0.5 и раздельные sd1, sd2
-                p2 = (p1 + mde_abs) if p1 < 0.5 else (p1 - mde_abs)
-                p2 = min(max(p2, 1e-6), 1.0 - 1e-6)
                 sd1 = math.sqrt(2.0 * p1 * (1.0 - p1) * cuped_factor)
                 sd2 = math.sqrt((p1 * (1.0 - p1) + p2 * (1.0 - p2)) * cuped_factor)
                 n_equal_per_var = ((z_alpha * sd1 + z_beta * sd2) ** 2) / (mde_abs ** 2)
-                # Масштабируем при неравном сплите (при 50/50 allocation_multiplier / 4.0 == 1.0)
                 total_n_float = n_equal_per_var * num_variants * (allocation_multiplier / 4.0)
                 formula_used = "evan_miller_exact_two_proportion"
             elif binary_method == "pooled":
-                p2 = min(max(p1 + mde_abs, 1e-6), 1.0 - 1e-6)
                 p_pooled = (p1 + p2) / 2.0
                 pooled_var = p_pooled * (1.0 - p_pooled) * cuped_factor
                 total_n_float = ((z_alpha + z_beta) ** 2) * pooled_var * allocation_multiplier / (mde_abs ** 2)
@@ -158,15 +169,16 @@ class PowerAndSampleSizeEngine:
             total_n_float = ((z_alpha + z_beta) ** 2) * effective_variance * allocation_multiplier / (mde_abs ** 2)
             formula_used = "continuous_welch_or_delta"
 
-        # Поправка на конечную генеральную совокупность (FPC из calculator.net), если база ограничена
-        if finite_population_n is not None and finite_population_n > 1:
+        if finite_population_n is not None:
+            if finite_population_n <= 1:
+                raise ValueError("finite_population_n должен быть > 1.")
             total_n_float = (total_n_float * finite_population_n) / (total_n_float + finite_population_n - 1.0)
             formula_used += "_with_fpc"
 
         n_per_variant = int(math.ceil(total_n_float / num_variants))
         total_sample_size = n_per_variant * num_variants
 
-        raw_days = math.ceil(total_sample_size / max(daily_traffic, 1))
+        raw_days = math.ceil(total_sample_size / daily_traffic)
         estimated_days = max(7, int(raw_days))
         is_feasible = estimated_days <= 35
 
@@ -218,11 +230,6 @@ class PowerAndSampleSizeEngine:
         finite_population_n: Optional[int] = None,
         power_for_ab: float = 0.80,
     ) -> ConfidenceIntervalAuditResult:
-        """
-        Точная реализация калькулятора Calculator.net (режим Find Confidence Interval / Margin of Error):
-        1) Считает предельную ошибку (MoE) одной выборки с учетом Finite Population Correction (FPC)
-        2) Дополнительно показывает, какой относительный MDE можно прокрасить в A/B-тесте, если разделить эту выборку 50/50
-        """
         if sample_size <= 1:
             raise ValueError("Размер выборки sample_size должен быть > 1.")
         if not (0.0 < proportion < 1.0):
@@ -240,7 +247,6 @@ class PowerAndSampleSizeEngine:
         se = math.sqrt(proportion * (1.0 - proportion) / sample_size) * fpc_factor
         moe_abs = z_crit * se
 
-        # Какой относительный MDE можно засечь в честном A/B-тесте, если эти sample_size юзеров разбить 50/50
         z_beta = float(stats.norm.ppf(power_for_ab))
         ab_mde_abs = (z_crit + z_beta) * math.sqrt(4.0 * proportion * (1.0 - proportion) / sample_size) * fpc_factor
         ab_mde_rel = ab_mde_abs / proportion
@@ -270,7 +276,8 @@ class PowerAndSampleSizeEngine:
         alpha: float = 0.05,
         power: float = 0.80,
     ) -> SwitchbackPowerResult:
-        """Расчет MDE для Switchback и кластерных тестов с учетом макро-дисперсии и CV размеров ячеек."""
+        if baseline_mean <= 0 or total_variance <= 0 or mean_cell_size_n <= 0 or cell_size_cv < 0:
+            raise ValueError("Параметры Switchback должны быть положительными (cell_size_cv >= 0).")
         total_cells_b = num_clusters_j * num_time_windows_h
         if total_cells_b < 4:
             raise ValueError("Общее число ячеек (J кластеров * H окон времени) должно быть >= 4.")

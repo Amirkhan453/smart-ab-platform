@@ -1,5 +1,5 @@
 import math
-from typing import Dict, List
+from typing import Sequence
 import numpy as np
 from scipy import stats
 
@@ -7,10 +7,9 @@ from scipy import stats
 class ExperimentSafeguardEngine:
     """
     Система защиты эксперимента в реальном времени (eBay / Cloud Wizard methodology):
-    - SPRT (Sequential Probability Ratio Test) для детекции SRM без проблемы подглядывания (peeking)
-    - PSI (Population Stability Index) для проверки пред-экспериментального баланса сегментов
-    - Двухэтапная диагностика SRM (Assigned stage vs Triggered stage)
-    - Проверка Guardrail-метрик для автоматической остановки (Auto-Revert) с поддержкой нулевого бейзлайна
+    - Строгая валидация счетчиков и ожидаемых долей трафика
+    - Последовательный критерий SPRT для парного SRM и мультиномиальный Chi2 для Multi-Arm (A/B/C/n)
+    - Защищенный от нулевых сумм расчет индекса стабильности популяции (PSI)
     """
 
     @staticmethod
@@ -22,13 +21,23 @@ class ExperimentSafeguardEngine:
         beta: float = 0.10,
         tolerance_delta: float = 0.01,
     ) -> dict:
-        """
-        Последовательный критерий отношения правдоподобия (SPRT) для детекции Sample Ratio Mismatch.
-        Проверяет H0: p = p0 против H1: |p - p0| >= delta без инфляции ошибки I рода при частом мониторинге.
-        """
+        if n_control < 0 or n_treatment < 0:
+            raise ValueError("Количество пользователей в группах не может быть отрицательным.")
+        if not (0.0 < expected_treatment_ratio < 1.0):
+            raise ValueError("expected_treatment_ratio должен лежать строго в интервале (0, 1).")
+        if not (0.0 < alpha < 0.5) or not (0.0 < beta < 0.5) or tolerance_delta <= 0.0:
+            raise ValueError("Некорректные параметры чувствительности SPRT.")
+
         total_n = n_control + n_treatment
         if total_n == 0:
-            return {"status": "continue", "srm_detected": False, "log_likelihood_ratio": 0.0}
+            return {
+                "status": "continue",
+                "srm_detected": False,
+                "observed_treatment_share": 0.0,
+                "expected_treatment_share": expected_treatment_ratio,
+                "log_likelihood_ratio": 0.0,
+                "chi2_pvalue": 1.0,
+            }
 
         p0 = expected_treatment_ratio
         obs_p = n_treatment / total_n
@@ -68,6 +77,35 @@ class ExperimentSafeguardEngine:
             "chi2_pvalue": chi2_pval,
         }
 
+    @staticmethod
+    def detect_multinomial_srm(
+        observed_counts: Sequence[int],
+        expected_shares: Sequence[float],
+        alpha_srm: float = 0.001,
+    ) -> dict:
+        obs = np.asarray(observed_counts, dtype=float)
+        exp_p = np.asarray(expected_shares, dtype=float)
+        if len(obs) < 2 or len(obs) != len(exp_p):
+            raise ValueError("observed_counts и expected_shares должны иметь одинаковую длину >= 2.")
+        if np.any(obs < 0):
+            raise ValueError("observed_counts не может содержать отрицательные значения.")
+        if np.any(exp_p <= 0) or abs(float(np.sum(exp_p)) - 1.0) > 1e-3:
+            raise ValueError("Сумма expected_shares должна быть равна 1.0, а все доли > 0.")
+
+        total_n = float(np.sum(obs))
+        if total_n == 0:
+            return {"srm_detected": False, "chi2_pvalue": 1.0, "chi2_statistic": 0.0}
+
+        expected_counts = total_n * exp_p
+        chi2_stat, p_val = stats.chisquare(f_obs=obs, f_exp=expected_counts)
+        return {
+            "srm_detected": bool(p_val < alpha_srm),
+            "chi2_pvalue": float(p_val),
+            "chi2_statistic": float(chi2_stat),
+            "observed_shares": [round(float(x / total_n), 5) for x in obs],
+            "expected_shares": [round(float(p), 5) for p in exp_p],
+        }
+
     @classmethod
     def diagnose_srm_stage(
         cls,
@@ -77,11 +115,6 @@ class ExperimentSafeguardEngine:
         triggered_treatment: int,
         expected_ratio: float = 0.5,
     ) -> dict:
-        """
-        Определяет точную стадию возникновения SRM (по архитектуре eBay):
-        - Если SRM уже в Assigned -> баг в роутинге/хэшировании/конфиге слоев
-        - Если Assigned чистый, а SRM в Triggered -> клиентская задержка (latency), баг фильтрации ботов или редирект
-        """
         assigned_check = cls.detect_srm_sprt(assigned_control, assigned_treatment, expected_ratio)
         triggered_check = cls.detect_srm_sprt(triggered_control, triggered_treatment, expected_ratio)
 
@@ -109,12 +142,20 @@ class ExperimentSafeguardEngine:
     def calculate_psi(
         control_dist: np.ndarray, treatment_dist: np.ndarray, epsilon: float = 1e-6
     ) -> dict:
-        """Расчет Population Stability Index (PSI) для валидации качества рандомизации по когортам/сегментам."""
         c = np.asarray(control_dist, dtype=float)
         t = np.asarray(treatment_dist, dtype=float)
+        if c.size == 0 or t.size == 0 or c.size != t.size:
+            raise ValueError("Массивы распределений для PSI должны быть непустыми и одинаковой длины.")
+        if np.any(c < 0) or np.any(t < 0):
+            raise ValueError("Частоты сегментов в PSI не могут быть отрицательными.")
 
-        p_c = np.clip(c / np.sum(c), epsilon, 1.0)
-        p_t = np.clip(t / np.sum(t), epsilon, 1.0)
+        sum_c = float(np.sum(c))
+        sum_t = float(np.sum(t))
+        if sum_c <= 0.0 or sum_t <= 0.0:
+            raise ValueError("Сумма элементов в распределениях PSI должна быть строго положительной (> 0).")
+
+        p_c = np.clip(c / sum_c, epsilon, 1.0)
+        p_t = np.clip(t / sum_t, epsilon, 1.0)
 
         psi_val = float(np.sum((p_t - p_c) * np.log(p_t / p_c)))
         return {
@@ -132,10 +173,9 @@ class ExperimentSafeguardEngine:
         higher_is_better: bool = True,
         alpha_guardrail: float = 0.05,
     ) -> dict:
-        """
-        Проверяет, пробила ли защитная метрика (Guardrail) допустимый порог деградации.
-        Корректно обрабатывает случай baseline_control == 0.0 (например, 0 ошибок в контроле).
-        """
+        if max_allowed_degradation_rel <= 0.0:
+            raise ValueError("max_allowed_degradation_rel должен быть > 0.")
+
         if abs(baseline_control) < 1e-12:
             if abs(treatment_value) < 1e-12:
                 rel_change = 0.0
