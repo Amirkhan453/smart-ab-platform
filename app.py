@@ -268,13 +268,13 @@ with tab1:
             ),
         )
         st.session_state["passport"] = current_passport
-        st.success("✅ Паспорт Эксперимента прошел все методологические проверки и зафиксирован!")
+        st.success("Паспорт Эксперимента прошел все методологические проверки и зафиксирован!")
     except Exception as exc:
-        st.error(f"❌ Ошибка валидации Паспорта Эксперимента: {exc}")
+        st.error(f"Ошибка валидации Паспорта Эксперимента: {exc}")
 
 
 with tab2:
-    st.subheader("📐 Калькулятор Выборки, MDE и Длительности (Evan Miller • Calculator.net • Switchback)")
+    st.subheader("Калькулятор Выборки, MDE и Длительности (Evan Miller • Calculator.net • Switchback)")
     calc_mode = st.radio(
         "Выберите режим калькулятора:",
         [
@@ -550,7 +550,7 @@ with tab6:
         n_q = 1200
         x1, x2 = rng_q.normal(0, 1, n_q), rng_q.normal(0, 1, n_q)
         p_t = 1.0 / (1.0 + np.exp(-(1.1 * x1 + 0.8 * x2)))
-        t_q = (rng_q.random(n_q) < p_t).astype(int)
+        t_q = (rng_q.random(n_q) < p_t).astype(int) 
         y_q = 50.0 + 10.0 * x1 + 7.0 * x2 + 12.0 * t_q + rng_q.normal(0, 2.0, n_q)
         q_df = pd.DataFrame({"treatment": t_q, "x1": x1, "x2": x2, "y": y_q})
 
