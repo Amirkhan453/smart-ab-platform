@@ -19,6 +19,11 @@ class SampleSizeResult:
     formula_used: str
     recommendation: str
     tradeoff_table: List[Dict[str, float]]
+    sidedness: str
+    num_treatments: int
+    alpha_adjusted: float
+    design_effect: float
+    traffic_exposure_share: float
 
 
 @dataclass
@@ -50,6 +55,13 @@ class PowerAndSampleSizeEngine:
     Математическое ядро расчета выборки, MDE, доверительных интервалов и длительности:
     - Строгая валидация всех входных параметров (baseline, traffic, alpha, power, allocation)
     - Точная формула Эвана Миллера с учетом направления изменения (Direction.INCREASE / DECREASE)
+    - Поправка на сторонность теста (sidedness) и число тестовых вариантов (Bonferroni по FWER)
+    - design effect для кластерных/switchback-дизайнов (через ICC и средний размер кластера)
+    - Учет фактической доли трафика эксперимента (слот слоя, ramp-up) через traffic_exposure_share
+
+    При параметрах по умолчанию (sidedness="two_sided", num_variants=2, design_effect=1.0,
+    traffic_exposure_share=1.0) численные результаты (n_per_variant, total_sample_size)
+    совпадают с результатами версии без этих параметров.
     """
 
     @staticmethod
@@ -90,10 +102,15 @@ class PowerAndSampleSizeEngine:
         expected_direction: Direction = Direction.INCREASE,
         alpha: float = 0.05,
         power: float = 0.80,
+        sidedness: Literal["two_sided", "one_sided"] = "two_sided",
         daily_traffic: int = 10000,
+        traffic_exposure_share: float = 1.0,
         num_variants: int = 2,
         treatment_allocation_ratio: float = 0.5,
         pre_post_correlation_r: float = 0.0,
+        design_effect: float = 1.0,
+        icc: Optional[float] = None,
+        mean_cluster_size: Optional[float] = None,
         finite_population_n: Optional[int] = None,
     ) -> SampleSizeResult:
         if baseline_mean <= 0.0:
@@ -108,6 +125,20 @@ class PowerAndSampleSizeEngine:
             raise ValueError("alpha должен быть в интервале (0, 0.5).")
         if not (0.5 <= power < 1.0):
             raise ValueError("power должен быть в интервале [0.5, 1.0).")
+        if not (0.0 < traffic_exposure_share <= 1.0):
+            raise ValueError(f"traffic_exposure_share должен быть в (0, 1], получено: {traffic_exposure_share}")
+        if sidedness not in ("two_sided", "one_sided"):
+            raise ValueError("sidedness должен быть 'two_sided' или 'one_sided'.")
+        if design_effect <= 0.0:
+            raise ValueError("design_effect должен быть строго положительным.")
+        if icc is not None or mean_cluster_size is not None:
+            if icc is None or mean_cluster_size is None:
+                raise ValueError("icc и mean_cluster_size должны передаваться вместе.")
+            if not (0.0 <= icc < 1.0):
+                raise ValueError("icc должен быть в интервале [0, 1).")
+            if mean_cluster_size < 1.0:
+                raise ValueError("mean_cluster_size должен быть >= 1.")
+            design_effect = 1.0 + (mean_cluster_size - 1.0) * icc
 
         if mde_relative is None and mde_absolute is None:
             raise ValueError("Необходимо передать либо mde_relative, либо mde_absolute.")
@@ -126,7 +157,12 @@ class PowerAndSampleSizeEngine:
         if not (0.0 <= abs(pre_post_correlation_r) < 1.0):
             raise ValueError("Корреляция ковариаты pre_post_correlation_r должна быть в пределах [0, 1).")
 
-        z_alpha = float(stats.norm.ppf(1.0 - alpha / 2.0))
+        num_treatments = max(num_variants - 1, 1)
+        alpha_adjusted = alpha / num_treatments
+        if sidedness == "two_sided":
+            z_alpha = float(stats.norm.ppf(1.0 - alpha_adjusted / 2.0))
+        else:
+            z_alpha = float(stats.norm.ppf(1.0 - alpha_adjusted))
         z_beta = float(stats.norm.ppf(power))
         cuped_factor = 1.0 - (pre_post_correlation_r ** 2)
         variance_reduction_pct = (pre_post_correlation_r ** 2) * 100.0
@@ -145,17 +181,17 @@ class PowerAndSampleSizeEngine:
                     f"Целевая конверсия p2={p2:.4f} выходит за пределы (0, 1) при baseline={p1} и mde_abs={mde_abs}."
                 )
             raw_variance = p1 * (1.0 - p1)
-            effective_variance = raw_variance * cuped_factor
+            effective_variance = raw_variance * cuped_factor * design_effect
 
             if binary_method == "evan_miller":
-                sd1 = math.sqrt(2.0 * p1 * (1.0 - p1) * cuped_factor)
-                sd2 = math.sqrt((p1 * (1.0 - p1) + p2 * (1.0 - p2)) * cuped_factor)
+                sd1 = math.sqrt(2.0 * p1 * (1.0 - p1) * cuped_factor * design_effect)
+                sd2 = math.sqrt((p1 * (1.0 - p1) + p2 * (1.0 - p2)) * cuped_factor * design_effect)
                 n_equal_per_var = ((z_alpha * sd1 + z_beta * sd2) ** 2) / (mde_abs ** 2)
                 total_n_float = n_equal_per_var * num_variants * (allocation_multiplier / 4.0)
                 formula_used = "evan_miller_exact_two_proportion"
             elif binary_method == "pooled":
                 p_pooled = (p1 + p2) / 2.0
-                pooled_var = p_pooled * (1.0 - p_pooled) * cuped_factor
+                pooled_var = p_pooled * (1.0 - p_pooled) * cuped_factor * design_effect
                 total_n_float = ((z_alpha + z_beta) ** 2) * pooled_var * allocation_multiplier / (mde_abs ** 2)
                 formula_used = "pooled_two_proportion"
             else:
@@ -165,7 +201,7 @@ class PowerAndSampleSizeEngine:
             if metric_variance is None or metric_variance <= 0:
                 raise ValueError("Для непрерывной или Ratio-метрики необходимо передать metric_variance > 0.")
             raw_variance = metric_variance
-            effective_variance = raw_variance * cuped_factor
+            effective_variance = raw_variance * cuped_factor * design_effect
             total_n_float = ((z_alpha + z_beta) ** 2) * effective_variance * allocation_multiplier / (mde_abs ** 2)
             formula_used = "continuous_welch_or_delta"
 
@@ -178,20 +214,21 @@ class PowerAndSampleSizeEngine:
         n_per_variant = int(math.ceil(total_n_float / num_variants))
         total_sample_size = n_per_variant * num_variants
 
-        raw_days = math.ceil(total_sample_size / daily_traffic)
-        estimated_days = max(7, int(raw_days))
+        effective_daily_traffic = daily_traffic * traffic_exposure_share
+        raw_days = math.ceil(total_sample_size / effective_daily_traffic)
+        estimated_days = max(7, int(math.ceil(raw_days / 7.0) * 7))
         is_feasible = estimated_days <= 35
 
         tradeoff_table = []
         for candidate_days in (7, 14, 21, 28, 35):
-            available_n = candidate_days * daily_traffic
+            available_n = candidate_days * effective_daily_traffic
             achievable_mde_abs = (z_alpha + z_beta) * math.sqrt(
                 (effective_variance * allocation_multiplier) / max(available_n, 2)
             )
             achievable_mde_rel = achievable_mde_abs / baseline_mean
             tradeoff_table.append({
                 "duration_days": candidate_days,
-                "total_users": available_n,
+                "total_users": round(available_n, 1),
                 "min_detectable_effect_rel_pct": round(achievable_mde_rel * 100.0, 2),
                 "min_detectable_effect_abs": round(achievable_mde_abs, 5),
             })
@@ -199,13 +236,18 @@ class PowerAndSampleSizeEngine:
         if is_feasible:
             recommendation = (
                 f"Дизайн корректен ({formula_used}): тест наберет мощность {int(power*100)}% за {estimated_days} дн. "
-                f"({n_per_variant:,} юзеров на группу, всего {total_sample_size:,}, сжатие CUPED: {variance_reduction_pct:.1f}%)."
+                f"({n_per_variant:,} юзеров на группу, всего {total_sample_size:,}, сжатие CUPED: {variance_reduction_pct:.1f}%, "
+                f"design_effect: {design_effect:.2f}, traffic_exposure_share: {traffic_exposure_share:.2f})."
             )
         else:
             mde_14d = tradeoff_table[1]["min_detectable_effect_rel_pct"]
             recommendation = (
-                f"ВНИМАНИЕ: При трафике {daily_traffic:,}/день для MDE={mde_rel*100:.1f}% нужно {estimated_days} дн. (>5 недель). "
-                f"Рекомендация ИИ: 1) Включите CUPED; 2) За 14 дней можно поймать эффект от {mde_14d}%; 3) Используйте бандитов."
+                f"ВНИМАНИЕ: При эффективном трафике {effective_daily_traffic:,.0f}/день для MDE={mde_rel*100:.1f}% "
+                f"нужно {estimated_days} дн. (>5 недель, округлено до кратного 7). Варианты: "
+                f"1) Включите CUPED, если ковариата доступна (снижает дисперсию и объём выборки); "
+                f"2) За 14 дней можно поймать эффект от {mde_14d}%; "
+                f"3) Увеличьте traffic_exposure_share (долю слота слоя/ramp-up) или дневной трафик; "
+                f"4) Используйте стратификацию по ключевым ковариатам для снижения остаточной дисперсии."
             )
 
         return SampleSizeResult(
@@ -220,6 +262,11 @@ class PowerAndSampleSizeEngine:
             formula_used=formula_used,
             recommendation=recommendation,
             tradeoff_table=tradeoff_table,
+            sidedness=sidedness,
+            num_treatments=num_treatments,
+            alpha_adjusted=alpha_adjusted,
+            design_effect=round(design_effect, 4),
+            traffic_exposure_share=traffic_exposure_share,
         )
 
     @staticmethod
