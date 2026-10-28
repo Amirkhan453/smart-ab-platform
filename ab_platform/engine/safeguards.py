@@ -1,16 +1,84 @@
 import math
-from typing import Sequence
+from enum import Enum
+from typing import List, Sequence
 import numpy as np
 from scipy import stats
+
+
+class GuardrailStatus(str, Enum):
+    SAFE_PROVEN = "SAFE_PROVEN"
+    BREACH_PROVEN = "BREACH_PROVEN"
+    INCONCLUSIVE_LOW_POWER = "INCONCLUSIVE_LOW_POWER"
 
 
 class ExperimentSafeguardEngine:
     """
     Система защиты эксперимента в реальном времени (eBay / Cloud Wizard methodology):
     - Строгая валидация счетчиков и ожидаемых долей трафика
-    - Последовательный критерий SPRT для парного SRM и мультиномиальный Chi2 для Multi-Arm (A/B/C/n)
+    - Основной критерий SRM: Хи-квадрат (alpha=0.001 по умолчанию) раздельно для Assigned и Triggered
+    - SPRT оставлен как опциональный потоковый метод непрерывного мониторинга
+    - Мультиномиальный Chi2 для Multi-Arm (A/B/C/n)
+    - Односторонний тест не-худшести для Guardrail (SAFE_PROVEN / BREACH_PROVEN / INCONCLUSIVE_LOW_POWER)
     - Защищенный от нулевых сумм расчет индекса стабильности популяции (PSI)
     """
+
+    @staticmethod
+    def min_detectable_srm_shift(total_n: float, expected_treatment_ratio: float = 0.5, alpha: float = 0.001) -> float:
+        """
+        Минимальный перекос доли treatment (в абсолютных долях, 0.01 = 1 п.п.), при котором
+        хи-квадрат (df=1) при текущем N достигает критического значения для alpha.
+        """
+        if total_n <= 0:
+            return float("inf")
+        p0 = expected_treatment_ratio
+        chi2_crit = float(stats.chi2.ppf(1.0 - alpha, df=1))
+        return float(math.sqrt(chi2_crit * p0 * (1.0 - p0) / total_n))
+
+    @classmethod
+    def detect_srm_chi2(
+        cls,
+        n_control: int,
+        n_treatment: int,
+        expected_treatment_ratio: float = 0.5,
+        alpha: float = 0.001,
+    ) -> dict:
+        if n_control < 0 or n_treatment < 0:
+            raise ValueError("Количество пользователей в группах не может быть отрицательным.")
+        if not (0.0 < expected_treatment_ratio < 1.0):
+            raise ValueError("expected_treatment_ratio должен лежать строго в интервале (0, 1).")
+        if not (0.0 < alpha < 0.5):
+            raise ValueError("alpha должен лежать в интервале (0, 0.5).")
+
+        total_n = n_control + n_treatment
+        min_shift = cls.min_detectable_srm_shift(total_n, expected_treatment_ratio, alpha)
+        if total_n == 0:
+            return {
+                "method": "chi2",
+                "srm_detected": False,
+                "observed_treatment_share": 0.0,
+                "expected_treatment_share": expected_treatment_ratio,
+                "chi2_statistic": 0.0,
+                "chi2_pvalue": 1.0,
+                "alpha": alpha,
+                "min_detectable_srm_shift": min_shift,
+            }
+
+        p0 = expected_treatment_ratio
+        expected_t = total_n * p0
+        expected_c = total_n * (1.0 - p0)
+        chi2_stat = ((n_treatment - expected_t) ** 2) / expected_t + ((n_control - expected_c) ** 2) / expected_c
+        chi2_pval = float(stats.chi2.sf(chi2_stat, df=1))
+
+        return {
+            "method": "chi2",
+            "srm_detected": bool(chi2_pval < alpha),
+            "observed_treatment_share": round(n_treatment / total_n, 5),
+            "expected_treatment_share": p0,
+            "chi2_statistic": float(chi2_stat),
+            "chi2_pvalue": chi2_pval,
+            "alpha": alpha,
+            "min_detectable_srm_shift": min_shift,
+        }
 
     @staticmethod
     def detect_srm_sprt(
@@ -21,6 +89,7 @@ class ExperimentSafeguardEngine:
         beta: float = 0.10,
         tolerance_delta: float = 0.01,
     ) -> dict:
+        """Опциональный потоковый SRM-критерий (SPRT); основной критерий — detect_srm_chi2."""
         if n_control < 0 or n_treatment < 0:
             raise ValueError("Количество пользователей в группах не может быть отрицательным.")
         if not (0.0 < expected_treatment_ratio < 1.0):
@@ -114,9 +183,10 @@ class ExperimentSafeguardEngine:
         triggered_control: int,
         triggered_treatment: int,
         expected_ratio: float = 0.5,
+        alpha_srm: float = 0.001,
     ) -> dict:
-        assigned_check = cls.detect_srm_sprt(assigned_control, assigned_treatment, expected_ratio)
-        triggered_check = cls.detect_srm_sprt(triggered_control, triggered_treatment, expected_ratio)
+        assigned_check = cls.detect_srm_chi2(assigned_control, assigned_treatment, expected_ratio, alpha_srm)
+        triggered_check = cls.detect_srm_chi2(triggered_control, triggered_treatment, expected_ratio, alpha_srm)
 
         if assigned_check["srm_detected"]:
             root_cause = (
@@ -136,6 +206,14 @@ class ExperimentSafeguardEngine:
             "assigned_srm": assigned_check["srm_detected"],
             "triggered_srm": triggered_check["srm_detected"],
             "diagnosis": root_cause,
+            "method": "chi2",
+            "alpha_srm": alpha_srm,
+            "assigned_details": assigned_check,
+            "triggered_details": triggered_check,
+            "min_detectable_srm_shift": {
+                "assigned": assigned_check["min_detectable_srm_shift"],
+                "triggered": triggered_check["min_detectable_srm_shift"],
+            },
         }
 
     @staticmethod
@@ -168,31 +246,101 @@ class ExperimentSafeguardEngine:
     def evaluate_guardrail_breach(
         baseline_control: float,
         treatment_value: float,
-        p_value: float,
         max_allowed_degradation_rel: float,
         higher_is_better: bool = True,
         alpha_guardrail: float = 0.05,
+        ci_lower_diff: float | None = None,
+        ci_upper_diff: float | None = None,
+        p_value: float | None = None,
     ) -> dict:
+        """
+        Односторонний тест не-худшести относительно границы delta = max_allowed_degradation_rel.
+        ci_lower_diff/ci_upper_diff — двусторонний (1 - alpha_guardrail) ДИ разности (treatment - control)
+        в абсолютных единицах метрики, построенный с тем же alpha_guardrail.
+        """
         if max_allowed_degradation_rel <= 0.0:
             raise ValueError("max_allowed_degradation_rel должен быть > 0.")
+        if not (0.0 < alpha_guardrail < 0.5):
+            raise ValueError("alpha_guardrail должен лежать в интервале (0, 0.5).")
 
-        if abs(baseline_control) < 1e-12:
-            if abs(treatment_value) < 1e-12:
-                rel_change = 0.0
-                degradation = 0.0
-            else:
-                rel_change = float(treatment_value - baseline_control)
-                degradation = -rel_change if higher_is_better else rel_change
+        delta = max_allowed_degradation_rel
+        denom = abs(baseline_control) if abs(baseline_control) >= 1e-12 else 1.0
+
+        rel_change = float(treatment_value - baseline_control) / denom
+        if abs(baseline_control) < 1e-12 and abs(treatment_value) < 1e-12:
+            rel_change = 0.0
+        degradation = -rel_change if higher_is_better else rel_change
+
+        if ci_lower_diff is None or ci_upper_diff is None:
+            if p_value is None:
+                raise ValueError(
+                    "Нужно передать ci_lower_diff и ci_upper_diff либо legacy p_value."
+                )
+            breached = bool(degradation > delta and float(p_value) < alpha_guardrail)
+            return {
+                "relative_change_pct": round(rel_change * 100.0, 3),
+                "degradation_pct": round(degradation * 100.0, 3),
+                "threshold_pct": round(delta * 100.0, 3),
+                "degradation_upper_bound_pct": round(degradation * 100.0, 3),
+                "degradation_lower_bound_pct": round(degradation * 100.0, 3),
+                "p_value_breach": float(p_value),
+                "status": GuardrailStatus.BREACH_PROVEN if breached else GuardrailStatus.INCONCLUSIVE_LOW_POWER,
+                "guardrail_breached": breached,
+                "action": "AUTO_STOP_AND_REVERT" if breached else "KEEP_RUNNING",
+            }
+
+        lo = 0.0 if np.isnan(ci_lower_diff) else float(ci_lower_diff) / denom
+        hi = 0.0 if np.isnan(ci_upper_diff) else float(ci_upper_diff) / denom
+        if higher_is_better:
+            deg_ci_lower, deg_ci_upper = -hi, -lo
         else:
-            rel_change = (treatment_value - baseline_control) / abs(baseline_control)
-            degradation = -rel_change if higher_is_better else rel_change
+            deg_ci_lower, deg_ci_upper = lo, hi
 
-        clean_pval = 1.0 if np.isnan(p_value) else float(p_value)
-        is_breached = bool((degradation > max_allowed_degradation_rel) and (clean_pval < alpha_guardrail))
+        z_two = float(stats.norm.ppf(1.0 - alpha_guardrail / 2.0))
+        z_one = float(stats.norm.ppf(1.0 - alpha_guardrail))
+        se = max((deg_ci_upper - deg_ci_lower) / (2.0 * z_two), 0.0)
+
+        if se > 1e-12:
+            p_value_breach = float(stats.norm.sf((degradation - delta) / se))
+        else:
+            p_value_breach = 0.0 if degradation > delta else 1.0
+
+        upper_one_sided = degradation + z_one * se
+        lower_one_sided = degradation - z_one * se
+
+        if upper_one_sided < delta:
+            status = GuardrailStatus.SAFE_PROVEN
+            action = "KEEP_RUNNING"
+        elif lower_one_sided > delta:
+            status = GuardrailStatus.BREACH_PROVEN
+            action = "AUTO_STOP_AND_REVERT"
+        else:
+            status = GuardrailStatus.INCONCLUSIVE_LOW_POWER
+            action = "HOLD_HUMAN_REVIEW"
+
         return {
             "relative_change_pct": round(rel_change * 100.0, 3),
             "degradation_pct": round(degradation * 100.0, 3),
-            "threshold_pct": round(max_allowed_degradation_rel * 100.0, 3),
-            "guardrail_breached": is_breached,
-            "action": "AUTO_STOP_AND_REVERT" if is_breached else "KEEP_RUNNING",
+            "threshold_pct": round(delta * 100.0, 3),
+            "degradation_upper_bound_pct": round(upper_one_sided * 100.0, 3),
+            "degradation_lower_bound_pct": round(lower_one_sided * 100.0, 3),
+            "p_value_breach": p_value_breach,
+            "status": status,
+            "guardrail_breached": bool(status == GuardrailStatus.BREACH_PROVEN),
+            "action": action,
         }
+
+    @staticmethod
+    def apply_holm_to_breach_signals(breach_pvalues: List[float], alpha: float = 0.05) -> List[bool]:
+        """Поправка Холма для сигнала «пробой доказан» по семейству guardrail-метрик."""
+        m = len(breach_pvalues)
+        if m == 0:
+            return []
+        order = sorted(range(m), key=lambda i: breach_pvalues[i])
+        rejects = [False] * m
+        for rank, idx in enumerate(order):
+            if breach_pvalues[idx] <= alpha / (m - rank):
+                rejects[idx] = True
+            else:
+                break
+        return rejects

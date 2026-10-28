@@ -350,9 +350,10 @@ class SmartABPlatformOrchestrator:
                 breach_eval = ExperimentSafeguardEngine.evaluate_guardrail_breach(
                     baseline_control=g_stat["mean_control"],
                     treatment_value=g_stat["mean_treatment"],
-                    p_value=g_stat["p_value"],
                     max_allowed_degradation_rel=g_def.max_allowed_degradation_rel,
                     higher_is_better=higher_is_better,
+                    ci_lower_diff=g_stat["ci_lower"],
+                    ci_upper_diff=g_stat["ci_upper"],
                 )
                 if breach_eval["guardrail_breached"]:
                     breached_arms.add(t_id)
