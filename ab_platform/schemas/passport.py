@@ -1,7 +1,9 @@
 from datetime import datetime, timezone
 from enum import Enum
-from typing import List, Optional
-from pydantic import BaseModel, Field, field_validator, model_validator
+import hashlib
+import json
+from typing import List, Literal, Optional
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class ExperimentType(str, Enum):
@@ -45,7 +47,8 @@ class Direction(str, Enum):
 
 
 class MetricDefinition(BaseModel):
-    """Строгое определение метрики до старта теста (защита от p-hacking и cherry-picking)."""
+    model_config = ConfigDict(frozen=True)
+
     name: str = Field(..., min_length=1, description="Системное имя метрики")
     metric_type: MetricType
     numerator_col: str = Field(..., min_length=1, description="Колонка числителя или самой метрики в БД")
@@ -67,7 +70,8 @@ class MetricDefinition(BaseModel):
 
 
 class GuardrailDefinition(BaseModel):
-    """Защитная метрика с жестким числовым порогом деградации для авто-остановки теста."""
+    model_config = ConfigDict(frozen=True)
+
     metric: MetricDefinition
     max_allowed_degradation_rel: float = Field(
         ..., gt=0.0, description="Максимально допустимое относительное ухудшение (например, 0.02 = 2%)"
@@ -79,13 +83,16 @@ class GuardrailDefinition(BaseModel):
 
 
 class VariantAllocation(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     variant_id: str = Field(..., min_length=1, description="Например: 'control', 'treatment_1'")
     traffic_percentage: float = Field(..., gt=0.0, le=100.0)
     is_control: bool = False
 
 
 class RiskProfile(BaseModel):
-    """Профиль бизнес-рисков, заполняемый ИИ-ассистентом при интервьюировании."""
+    model_config = ConfigDict(frozen=True)
+
     has_network_effects: bool = False
     has_cannibalization_risk: bool = False
     reaction_lag_days: int = Field(0, ge=0)
@@ -94,11 +101,17 @@ class RiskProfile(BaseModel):
 
 class ExperimentPassport(BaseModel):
     """
-    Главный неизменяемый контракт эксперимента (Pre-Registration Lock).
-    Фиксирует гипотезу, варианты, слои, метрики и настройки CUPED еще ДО запуска теста.
+    Неизменяемый контракт эксперимента v2.1 (Pre-Registration Lock, frozen=True).
     """
+    model_config = ConfigDict(frozen=True)
+
     experiment_id: str = Field(..., min_length=1)
     test_key: str = Field(..., min_length=1, description="Уникальный ключ фичи для ортогонального хэширования")
+    project_id: str = Field("default", min_length=1)
+    version: int = Field(1, ge=1)
+    status: str = Field("draft")
+    passport_hash: Optional[str] = None
+
     layer_id: str = Field("default_layer", min_length=1, description="Слой (Plane) для изоляции экспериментов")
     layer_slot_start: int = Field(0, ge=0, lt=10000, description="Начальный бакет-слот в слое [0..10000)")
     layer_slot_end: int = Field(10000, gt=0, le=10000, description="Конечный бакет-слот в слое (0..10000]")
@@ -122,17 +135,32 @@ class ExperimentPassport(BaseModel):
     use_cuped: bool = True
     use_lins_method: bool = False
     covariate_col: Optional[str] = Field("pre_revenue", description="Колонка пред-периода для CUPED")
+    cuped_min_r2: float = Field(0.05, ge=0.0, lt=1.0, description="Минимальный порог r^2 для применения CUPED")
+    pre_period_window_days: int = Field(14, ge=1)
 
     baseline_value: float = Field(..., gt=0.0, description="Историческое базовое значение целевой метрики")
     mde_relative: float = Field(..., gt=0.0, description="Минимально детектируемый относительный эффект")
+    practical_significance_threshold: float = Field(0.0, ge=0.0, description="Порог практической значимости")
     alpha: float = Field(0.05, gt=0.0, lt=0.5, description="Ошибка I рода (FPR)")
     power: float = Field(0.80, gt=0.5, lt=0.999, description="Статистическая мощность (1 - Beta)")
+    srm_alpha: float = Field(0.001, gt=0.0, lt=0.5, description="Порог значимости для критерия Хи-квадрат SRM")
+    analysis_mode: Literal["fixed_horizon", "sequential"] = "fixed_horizon"
+    sidedness: Literal["two_sided", "one_sided"] = "two_sided"
+    stratification_cols: List[str] = Field(default_factory=list)
+    bot_max_events_per_unit: Optional[int] = Field(None, ge=1)
 
     planned_duration_days: int = Field(..., ge=1, description="Планируемая длительность теста в днях")
+    maturation_days: int = Field(0, ge=0)
+    attribution_window_days: int = Field(7, ge=1)
     daily_eligible_units: int = Field(..., gt=0, description="Доступный трафик единиц рандомизации в день")
     allow_short_duration_override: bool = False
 
     risk_profile: RiskProfile = Field(default_factory=RiskProfile)
+
+    def compute_sha256(self) -> str:
+        payload = self.model_dump(mode="json", exclude={"passport_hash", "created_at", "status"})
+        canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
     @field_validator("variants")
     @classmethod
@@ -143,7 +171,7 @@ class ExperimentPassport(BaseModel):
         if len(set(ids)) != len(ids):
             raise ValueError("Идентификаторы вариантов (variant_id) должны быть уникальными.")
         total_pct = sum(v.traffic_percentage for v in variants)
-        if abs(total_pct - 100.0) > 1e-4:
+        if abs(total_pct - 100.0) > 1e-2:
             raise ValueError(f"Сумма долей трафика вариантов должна быть ровно 100%, получено: {total_pct}%.")
         controls = [v for v in variants if v.is_control]
         if len(controls) != 1:
@@ -193,5 +221,8 @@ class ExperimentPassport(BaseModel):
                 f"Лаг реакции клиентов ({self.risk_profile.reaction_lag_days} дн.) больше или равен "
                 f"длительности теста ({self.planned_duration_days} дн.)."
             )
+
+        if self.passport_hash is None:
+            object.__setattr__(self, "passport_hash", self.compute_sha256())
 
         return self
