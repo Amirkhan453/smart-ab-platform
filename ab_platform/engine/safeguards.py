@@ -246,12 +246,11 @@ class ExperimentSafeguardEngine:
     def evaluate_guardrail_breach(
         baseline_control: float,
         treatment_value: float,
+        ci_lower_diff: float,
+        ci_upper_diff: float,
         max_allowed_degradation_rel: float,
         higher_is_better: bool = True,
         alpha_guardrail: float = 0.05,
-        ci_lower_diff: float | None = None,
-        ci_upper_diff: float | None = None,
-        p_value: float | None = None,
     ) -> dict:
         """
         Односторонний тест не-худшести относительно границы delta = max_allowed_degradation_rel.
@@ -270,24 +269,6 @@ class ExperimentSafeguardEngine:
         if abs(baseline_control) < 1e-12 and abs(treatment_value) < 1e-12:
             rel_change = 0.0
         degradation = -rel_change if higher_is_better else rel_change
-
-        if ci_lower_diff is None or ci_upper_diff is None:
-            if p_value is None:
-                raise ValueError(
-                    "Нужно передать ci_lower_diff и ci_upper_diff либо legacy p_value."
-                )
-            breached = bool(degradation > delta and float(p_value) < alpha_guardrail)
-            return {
-                "relative_change_pct": round(rel_change * 100.0, 3),
-                "degradation_pct": round(degradation * 100.0, 3),
-                "threshold_pct": round(delta * 100.0, 3),
-                "degradation_upper_bound_pct": round(degradation * 100.0, 3),
-                "degradation_lower_bound_pct": round(degradation * 100.0, 3),
-                "p_value_breach": float(p_value),
-                "status": GuardrailStatus.BREACH_PROVEN if breached else GuardrailStatus.INCONCLUSIVE_LOW_POWER,
-                "guardrail_breached": breached,
-                "action": "AUTO_STOP_AND_REVERT" if breached else "KEEP_RUNNING",
-            }
 
         lo = 0.0 if np.isnan(ci_lower_diff) else float(ci_lower_diff) / denom
         hi = 0.0 if np.isnan(ci_upper_diff) else float(ci_upper_diff) / denom
