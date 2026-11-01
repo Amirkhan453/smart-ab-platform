@@ -1,9 +1,7 @@
 from datetime import datetime, timezone
 from enum import Enum
-import hashlib
-import json
 from typing import List, Literal, Optional
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class ExperimentType(str, Enum):
@@ -47,8 +45,6 @@ class Direction(str, Enum):
 
 
 class MetricDefinition(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
     name: str = Field(..., min_length=1, description="Системное имя метрики")
     metric_type: MetricType
     numerator_col: str = Field(..., min_length=1, description="Колонка числителя или самой метрики в БД")
@@ -70,8 +66,6 @@ class MetricDefinition(BaseModel):
 
 
 class GuardrailDefinition(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
     metric: MetricDefinition
     max_allowed_degradation_rel: float = Field(
         ..., gt=0.0, description="Максимально допустимое относительное ухудшение (например, 0.02 = 2%)"
@@ -83,16 +77,12 @@ class GuardrailDefinition(BaseModel):
 
 
 class VariantAllocation(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
     variant_id: str = Field(..., min_length=1, description="Например: 'control', 'treatment_1'")
     traffic_percentage: float = Field(..., gt=0.0, le=100.0)
     is_control: bool = False
 
 
 class RiskProfile(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
     has_network_effects: bool = False
     has_cannibalization_risk: bool = False
     reaction_lag_days: int = Field(0, ge=0)
@@ -100,18 +90,11 @@ class RiskProfile(BaseModel):
 
 
 class ExperimentPassport(BaseModel):
-    """
-    Неизменяемый контракт эксперимента v2.1 (Pre-Registration Lock, frozen=True).
-    """
-    model_config = ConfigDict(frozen=True)
-
     experiment_id: str = Field(..., min_length=1)
     test_key: str = Field(..., min_length=1, description="Уникальный ключ фичи для ортогонального хэширования")
     project_id: str = Field("default", min_length=1)
     version: int = Field(1, ge=1)
     status: str = Field("draft")
-    passport_hash: Optional[str] = None
-
     layer_id: str = Field("default_layer", min_length=1, description="Слой (Plane) для изоляции экспериментов")
     layer_slot_start: int = Field(0, ge=0, lt=10000, description="Начальный бакет-слот в слое [0..10000)")
     layer_slot_end: int = Field(10000, gt=0, le=10000, description="Конечный бакет-слот в слое (0..10000]")
@@ -147,7 +130,6 @@ class ExperimentPassport(BaseModel):
     analysis_mode: Literal["fixed_horizon", "sequential"] = "fixed_horizon"
     sidedness: Literal["two_sided", "one_sided"] = "two_sided"
     stratification_cols: List[str] = Field(default_factory=list)
-    bot_max_events_per_unit: Optional[int] = Field(None, ge=1)
 
     planned_duration_days: int = Field(..., ge=1, description="Планируемая длительность теста в днях")
     maturation_days: int = Field(0, ge=0)
@@ -156,11 +138,6 @@ class ExperimentPassport(BaseModel):
     allow_short_duration_override: bool = False
 
     risk_profile: RiskProfile = Field(default_factory=RiskProfile)
-
-    def compute_sha256(self) -> str:
-        payload = self.model_dump(mode="json", exclude={"passport_hash", "created_at", "status"})
-        canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False)
-        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
     @field_validator("variants")
     @classmethod
@@ -221,8 +198,5 @@ class ExperimentPassport(BaseModel):
                 f"Лаг реакции клиентов ({self.risk_profile.reaction_lag_days} дн.) больше или равен "
                 f"длительности теста ({self.planned_duration_days} дн.)."
             )
-
-        if self.passport_hash is None:
-            object.__setattr__(self, "passport_hash", self.compute_sha256())
 
         return self

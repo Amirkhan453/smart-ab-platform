@@ -1,7 +1,6 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, List, Optional
-import numpy as np
 import pandas as pd
 
 from ab_platform.schemas.passport import (
@@ -78,13 +77,6 @@ class ExperimentEvaluationReport:
 
 
 class SmartABPlatformOrchestrator:
-    """
-    Главный оркестратор умной A/B-платформы:
-    - Жестко проверяет наличие ВСЕХ колонок (Primary, Guardrail, Secondary, Denominators) — никаких silent skips!
-    - Принудительно агрегирует сырые события до единицы рандомизации (1 строка == 1 юзер/кластер) перед SRM и тестами
-    - Поддерживает Multi-Arm эксперименты (A/B/C/n) с мультиномиальным SRM и поправкой Холма-Бонферрони
-    """
-
     @staticmethod
     def _validate_required_columns(
         df: pd.DataFrame,
@@ -126,10 +118,6 @@ class SmartABPlatformOrchestrator:
         variant_col: str,
         covariate_col: Optional[str],
     ) -> pd.DataFrame:
-        """
-        Если в датасете несколько строк на одну единицу рандомизации (например, посессионные логи),
-        агрегирует их до 1 строки на (user_id, variant), чтобы исключить псевдорепликацию.
-        """
         if df.duplicated(subset=[user_col]).sum() == 0:
             return df.copy()
 
@@ -293,12 +281,10 @@ class SmartABPlatformOrchestrator:
 
         cls._validate_required_columns(df, passport, user_col, variant_col, validate_covariate_col)
 
-        # Шаг 1: Удаление пользователей с Double Exposure (попавших в >1 вариант)
         dedup_df, double_exp_frac = DataHygieneProcessor.remove_double_exposure(
             df, user_col=user_col, variant_col=variant_col
         )
 
-        # Шаг 2: Обязательная агрегация до единицы рандомизации (1 строка == 1 юзер/кластер)
         clean_df = cls._aggregate_to_randomization_unit(
             dedup_df, passport, user_col=user_col, variant_col=variant_col, covariate_col=effective_covariate_col
         )
@@ -307,7 +293,6 @@ class SmartABPlatformOrchestrator:
         control_id = control_alloc.variant_id
         treatment_allocs = [v for v in passport.variants if not v.is_control]
 
-        # Проверяем, что все заявленные в паспорте варианты присутствуют в данных
         observed_variants = set(clean_df[variant_col].unique())
         expected_variants = {v.variant_id for v in passport.variants}
         missing_variants = expected_variants - observed_variants
@@ -316,9 +301,6 @@ class SmartABPlatformOrchestrator:
                 f"В датасете отсутствуют наблюдения для вариантов, заявленных в Паспорте: {sorted(missing_variants)}"
             )
 
-        # Шаг 3: Проверка SRM (chi2 раздельно для Assigned/Triggered, мультиномиальный Chi2 для Multi-Arm)
-        # и повторная проверка SRM после гигиены (DAT-3): сравниваем сырые (до dedup) и
-        # пост-гигиенические (clean_df) триггерные доли, чтобы поймать перекос, внесенный самой фильтрацией.
         if len(passport.variants) == 2:
             t_id = treatment_allocs[0].variant_id
             raw_user_variant = df[[user_col, variant_col]].drop_duplicates()
@@ -371,7 +353,6 @@ class SmartABPlatformOrchestrator:
                 },
             }
 
-        # Шаг 4: Оценка каждого тестового варианта относительно контрольной группы
         variant_comparisons: Dict[str, Dict[str, Any]] = {}
         cuped_diag_map: Dict[str, Dict[str, Any]] = {}
         arm_pvals: List[float] = []
@@ -396,15 +377,12 @@ class SmartABPlatformOrchestrator:
             arm_pvals.append(p_res["p_value"])
             arm_ids.append(t_id)
 
-        # Поправка Холма-Бонферрони при наличии нескольких тестовых вариантов (Multi-Arm FWER)
         if len(arm_ids) > 1:
             holm_rejects, holm_pvals = StatCriterionRouter.apply_holm_bonferroni(arm_pvals, alpha=passport.alpha)
             for t_id, is_sig_h, p_adj in zip(arm_ids, holm_rejects, holm_pvals):
                 variant_comparisons[t_id]["p_value_holm_adjusted"] = p_adj
                 variant_comparisons[t_id]["is_significant"] = bool(is_sig_h)
 
-        # Шаг 5: Оценка Guardrail-метрик (non-inferiority + поправка Холма по семейству на каждом
-        # варианте) и Вторичных метрик (поправка BH/FDR по всему плоскому семейству (metric, variant))
         guardrail_summaries: List[GuardrailEvalSummary] = []
         secondary_summaries: List[SecondaryMetricEvalSummary] = []
         breached_arms = set()
@@ -486,7 +464,6 @@ class SmartABPlatformOrchestrator:
                 )
                 all_secondary_raw.append((t_id, sec_def, tier, t_alpha, s_res))
 
-        # BH/FDR по всему плоскому семейству пар (metric, treatment_variant) сразу по всем вариантам
         all_sec_pvals = [s_res["p_value"] for (_, _, _, _, s_res) in all_secondary_raw]
         fdr_decisions = (
             StatCriterionRouter.apply_fdr_correction(all_sec_pvals, alpha=passport.alpha)
@@ -510,7 +487,6 @@ class SmartABPlatformOrchestrator:
                 )
             )
 
-        # Выбираем лучший вариант среди не нарушивших Guardrails (или первый вариант для отчета)
         expected_dir = passport.primary_metric.expected_direction
         safe_arms = [t_id for t_id in arm_ids if t_id not in breached_arms]
         candidate_pool = safe_arms if safe_arms else arm_ids

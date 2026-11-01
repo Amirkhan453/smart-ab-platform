@@ -8,14 +8,6 @@ from ab_platform.engine.cuped import VarianceReductionEngine
 
 
 class AAValidationEngine:
-    """
-    Пре-flight валидация эксперимента через симуляцию A/A тестов:
-    - Сплит по единице рандомизации (user_col), опциональный CUPED-препроцессинг
-    - Проверка попадания FPR в 95% биномиальный интервал вокруг alpha (нормальное приближение)
-    - Проверка равномерности p-value (KS-тест, is_uniform_distribution при ks_pvalue > 0.01)
-    - Проверка баланса ковариат пре-периода по |SMD| < 0.1 (check_covariate_balance_smd)
-    """
-
     @staticmethod
     def run_aa_simulation(
         df: pd.DataFrame,
@@ -27,13 +19,6 @@ class AAValidationEngine:
         cuped_min_r2: float = 0.05,
         seed: int = 42,
     ) -> dict:
-        """
-        Боевой A/A контур: сплит выполняется по уникальной единице рандомизации
-        (user_col), а не по строкам, чтобы корректно работать при событийных
-        (не агрегированных) входных данных. Если передан covariate_col, на
-        каждой итерации применяется CUPED (VarianceReductionEngine.apply_cuped)
-        с тем же порогом cuped_min_r2, что и в боевом анализе.
-        """
         if metric_col not in df.columns:
             raise ValueError(f"Колонка '{metric_col}' отсутствует в датасете.")
         if user_col not in df.columns:
@@ -120,11 +105,6 @@ class AAValidationEngine:
         variant_col: str = "variant",
         smd_threshold: float = 0.1,
     ) -> dict:
-        """
-        Проверка баланса ковариат пре-периода между вариантами по стандартизированной
-        разности средних (SMD), попарно по всем парам вариантов. Безопасный дизайн
-        считается сбалансированным при |SMD| < smd_threshold (по умолчанию 0.1).
-        """
         for col in list(covariate_cols) + [variant_col]:
             if col not in df.columns:
                 raise ValueError(f"Колонка '{col}' отсутствует в датасете для проверки баланса.")

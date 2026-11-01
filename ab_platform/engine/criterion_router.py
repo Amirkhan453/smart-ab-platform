@@ -313,6 +313,17 @@ class StatCriterionRouter:
         treatment_cluster_ids: np.ndarray,
         alpha: float = 0.05,
     ) -> dict:
+        """
+        Кластерно-устойчивая оценка разности средних, ICC и design_effect для случая
+        randomization_unit != analysis_unit (например, рандомизация по user_id, а строки
+        метрики — на уровне session/pageview). ICC считается методом one-way random effects
+        ANOVA на объединенном пуле control+treatment; SE разности — методом коллапсирования
+        до средних по кластеру (состоятельный и устойчивый к дисбалансу размеров кластеров
+        способ получить корректные SE без сэндвич-оценки по сырым строкам). Примечание:
+        при кластерах размера 1 (randomization_unit == analysis_unit на практике) ICC
+        вырожден и формула возвращает значение около 1.0 — это ожидаемое поведение
+        one-way ANOVA оценщика на вырожденных входных данных, а не баг.
+        """
         c = np.asarray(control_vals, dtype=float)
         cc = np.asarray(control_cluster_ids)
         t = np.asarray(treatment_vals, dtype=float)

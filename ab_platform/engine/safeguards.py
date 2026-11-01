@@ -1,6 +1,6 @@
 import math
 from enum import Enum
-from typing import List, Sequence
+from typing import List, Optional, Sequence
 import numpy as np
 from scipy import stats
 
@@ -14,20 +14,14 @@ class GuardrailStatus(str, Enum):
 class ExperimentSafeguardEngine:
     """
     Система защиты эксперимента в реальном времени (eBay / Cloud Wizard methodology):
-    - Строгая валидация счетчиков и ожидаемых долей трафика
     - Основной критерий SRM: Хи-квадрат (alpha=0.001 по умолчанию) раздельно для Assigned и Triggered
     - SPRT оставлен как опциональный потоковый метод непрерывного мониторинга
     - Мультиномиальный Chi2 для Multi-Arm (A/B/C/n)
     - Односторонний тест не-худшести для Guardrail (SAFE_PROVEN / BREACH_PROVEN / INCONCLUSIVE_LOW_POWER)
-    - Защищенный от нулевых сумм расчет индекса стабильности популяции (PSI)
     """
 
     @staticmethod
     def min_detectable_srm_shift(total_n: float, expected_treatment_ratio: float = 0.5, alpha: float = 0.001) -> float:
-        """
-        Минимальный перекос доли treatment (в абсолютных долях, 0.01 = 1 п.п.), при котором
-        хи-квадрат (df=1) при текущем N достигает критического значения для alpha.
-        """
         if total_n <= 0:
             return float("inf")
         p0 = expected_treatment_ratio
@@ -89,7 +83,6 @@ class ExperimentSafeguardEngine:
         beta: float = 0.10,
         tolerance_delta: float = 0.01,
     ) -> dict:
-        """Опциональный потоковый SRM-критерий (SPRT); основной критерий — detect_srm_chi2."""
         if n_control < 0 or n_treatment < 0:
             raise ValueError("Количество пользователей в группах не может быть отрицательным.")
         if not (0.0 < expected_treatment_ratio < 1.0):
@@ -133,7 +126,7 @@ class ExperimentSafeguardEngine:
         expected_t = total_n * p0
         expected_c = total_n * (1.0 - p0)
         chi2_stat = ((n_treatment - expected_t) ** 2) / expected_t + ((n_control - expected_c) ** 2) / expected_c
-        chi2_pval = float(1.0 - stats.chi2.cdf(chi2_stat, df=1))
+        chi2_pval = float(stats.chi2.sf(chi2_stat, df=1))
 
         return {
             "status": status,
@@ -158,14 +151,14 @@ class ExperimentSafeguardEngine:
             raise ValueError("observed_counts и expected_shares должны иметь одинаковую длину >= 2.")
         if np.any(obs < 0):
             raise ValueError("observed_counts не может содержать отрицательные значения.")
-        if np.any(exp_p <= 0) or abs(float(np.sum(exp_p)) - 1.0) > 1e-3:
+        if np.any(exp_p <= 0) or abs(float(np.sum(exp_p)) - 1.0) > 1e-2:
             raise ValueError("Сумма expected_shares должна быть равна 1.0, а все доли > 0.")
 
         total_n = float(np.sum(obs))
         if total_n == 0:
             return {"srm_detected": False, "chi2_pvalue": 1.0, "chi2_statistic": 0.0}
 
-        expected_counts = total_n * exp_p
+        expected_counts = total_n * (exp_p / np.sum(exp_p))
         chi2_stat, p_val = stats.chisquare(f_obs=obs, f_exp=expected_counts)
         return {
             "srm_detected": bool(p_val < alpha_srm),
@@ -246,17 +239,13 @@ class ExperimentSafeguardEngine:
     def evaluate_guardrail_breach(
         baseline_control: float,
         treatment_value: float,
-        ci_lower_diff: float,
-        ci_upper_diff: float,
-        max_allowed_degradation_rel: float,
+        ci_lower_diff: Optional[float] = None,
+        ci_upper_diff: Optional[float] = None,
+        max_allowed_degradation_rel: float = 0.05,
         higher_is_better: bool = True,
         alpha_guardrail: float = 0.05,
+        p_value: Optional[float] = None,
     ) -> dict:
-        """
-        Односторонний тест не-худшести относительно границы delta = max_allowed_degradation_rel.
-        ci_lower_diff/ci_upper_diff — двусторонний (1 - alpha_guardrail) ДИ разности (treatment - control)
-        в абсолютных единицах метрики, построенный с тем же alpha_guardrail.
-        """
         if max_allowed_degradation_rel <= 0.0:
             raise ValueError("max_allowed_degradation_rel должен быть > 0.")
         if not (0.0 < alpha_guardrail < 0.5):
@@ -270,16 +259,23 @@ class ExperimentSafeguardEngine:
             rel_change = 0.0
         degradation = -rel_change if higher_is_better else rel_change
 
-        lo = 0.0 if np.isnan(ci_lower_diff) else float(ci_lower_diff) / denom
-        hi = 0.0 if np.isnan(ci_upper_diff) else float(ci_upper_diff) / denom
-        if higher_is_better:
-            deg_ci_lower, deg_ci_upper = -hi, -lo
-        else:
-            deg_ci_lower, deg_ci_upper = lo, hi
-
         z_two = float(stats.norm.ppf(1.0 - alpha_guardrail / 2.0))
         z_one = float(stats.norm.ppf(1.0 - alpha_guardrail))
-        se = max((deg_ci_upper - deg_ci_lower) / (2.0 * z_two), 0.0)
+
+        if ci_lower_diff is not None and ci_upper_diff is not None:
+            lo = 0.0 if np.isnan(ci_lower_diff) else float(ci_lower_diff) / denom
+            hi = 0.0 if np.isnan(ci_upper_diff) else float(ci_upper_diff) / denom
+            if higher_is_better:
+                deg_ci_lower, deg_ci_upper = -hi, -lo
+            else:
+                deg_ci_lower, deg_ci_upper = lo, hi
+            se = max((deg_ci_upper - deg_ci_lower) / (2.0 * z_two), 0.0)
+        elif p_value is not None:
+            clean_p = 1.0 if np.isnan(p_value) else float(np.clip(p_value, 1e-15, 1.0 - 1e-15))
+            z_obs = max(float(stats.norm.isf(clean_p / 2.0)), 1e-6)
+            se = abs(degradation) / z_obs if abs(degradation) > 1e-12 else 0.0
+        else:
+            se = 0.0
 
         if se > 1e-12:
             p_value_breach = float(stats.norm.sf((degradation - delta) / se))
@@ -313,7 +309,6 @@ class ExperimentSafeguardEngine:
 
     @staticmethod
     def apply_holm_to_breach_signals(breach_pvalues: List[float], alpha: float = 0.05) -> List[bool]:
-        """Поправка Холма для сигнала «пробой доказан» по семейству guardrail-метрик."""
         m = len(breach_pvalues)
         if m == 0:
             return []

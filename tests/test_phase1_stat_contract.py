@@ -1,6 +1,4 @@
-import math
 from unittest import mock
-
 import numpy as np
 import pandas as pd
 import pytest
@@ -149,9 +147,9 @@ class TestOrchestratorDecisionStatuses:
         df = _make_df()
         scenario = {
             "revenue": dict(mean_control=100.0, mean_treatment=103.0, relative_diff=0.03,
-                             p_value=0.001, ci_lower=1.0, ci_upper=5.0, is_significant=True),
+                            p_value=0.001, ci_lower=1.0, ci_upper=5.0, is_significant=True),
             "latency_0": dict(mean_control=200.0, mean_treatment=199.5, relative_diff=-0.0025,
-                               p_value=0.4, ci_lower=-3.0, ci_upper=2.0, is_significant=False),
+                              p_value=0.4, ci_lower=-3.0, ci_upper=2.0, is_significant=False),
         }
         with mock.patch.object(SmartABPlatformOrchestrator, "_evaluate_pair_metric", _fake_pair_metric(scenario)):
             report = SmartABPlatformOrchestrator.evaluate_experiment(passport99, df)
@@ -163,9 +161,9 @@ class TestOrchestratorDecisionStatuses:
         df = _make_df()
         scenario = {
             "revenue": dict(mean_control=100.0, mean_treatment=103.0, relative_diff=0.03,
-                             p_value=0.001, ci_lower=1.0, ci_upper=5.0, is_significant=True),
+                            p_value=0.001, ci_lower=1.0, ci_upper=5.0, is_significant=True),
             "latency_0": dict(mean_control=100.0, mean_treatment=103.0, relative_diff=0.03,
-                               p_value=0.2, ci_lower=-1.0, ci_upper=7.0, is_significant=False),
+                              p_value=0.2, ci_lower=-1.0, ci_upper=7.0, is_significant=False),
         }
         with mock.patch.object(SmartABPlatformOrchestrator, "_evaluate_pair_metric", _fake_pair_metric(scenario)):
             report = SmartABPlatformOrchestrator.evaluate_experiment(passport, df)
@@ -178,9 +176,9 @@ class TestOrchestratorDecisionStatuses:
         df = _make_df()
         scenario = {
             "revenue": dict(mean_control=100.0, mean_treatment=103.0, relative_diff=0.03,
-                             p_value=0.001, ci_lower=1.0, ci_upper=5.0, is_significant=True),
+                            p_value=0.001, ci_lower=1.0, ci_upper=5.0, is_significant=True),
             "latency_0": dict(mean_control=100.0, mean_treatment=110.0, relative_diff=0.10,
-                               p_value=0.001, ci_lower=8.0, ci_upper=12.0, is_significant=True),
+                              p_value=0.001, ci_lower=8.0, ci_upper=12.0, is_significant=True),
         }
         with mock.patch.object(SmartABPlatformOrchestrator, "_evaluate_pair_metric", _fake_pair_metric(scenario)):
             report = SmartABPlatformOrchestrator.evaluate_experiment(passport, df)
@@ -191,11 +189,11 @@ class TestOrchestratorDecisionStatuses:
         passport = _make_passport()
         df = _make_df()
         guardrail_ok = dict(mean_control=200.0, mean_treatment=199.5, relative_diff=-0.0025,
-                             p_value=0.4, ci_lower=-3.0, ci_upper=2.0, is_significant=False)
+                            p_value=0.4, ci_lower=-3.0, ci_upper=2.0, is_significant=False)
 
         scenario_neutral = {
             "revenue": dict(mean_control=100.0, mean_treatment=100.2, relative_diff=0.002,
-                             p_value=0.6, ci_lower=-0.5, ci_upper=0.9, is_significant=False),
+                            p_value=0.6, ci_lower=-0.5, ci_upper=0.9, is_significant=False),
             "latency_0": guardrail_ok,
         }
         with mock.patch.object(SmartABPlatformOrchestrator, "_evaluate_pair_metric", _fake_pair_metric(scenario_neutral)):
@@ -204,7 +202,7 @@ class TestOrchestratorDecisionStatuses:
 
         scenario_inconclusive = {
             "revenue": dict(mean_control=100.0, mean_treatment=101.0, relative_diff=0.01,
-                             p_value=0.3, ci_lower=-1.0, ci_upper=5.0, is_significant=False),
+                            p_value=0.3, ci_lower=-1.0, ci_upper=5.0, is_significant=False),
             "latency_0": guardrail_ok,
         }
         with mock.patch.object(SmartABPlatformOrchestrator, "_evaluate_pair_metric", _fake_pair_metric(scenario_inconclusive)):
@@ -224,9 +222,9 @@ class TestOrchestratorDecisionStatuses:
         })
         scenario = {
             "revenue": dict(mean_control=100.0, mean_treatment=103.0, relative_diff=0.03,
-                             p_value=0.001, ci_lower=1.0, ci_upper=5.0, is_significant=True),
+                            p_value=0.001, ci_lower=1.0, ci_upper=5.0, is_significant=True),
             "latency_0": dict(mean_control=200.0, mean_treatment=199.5, relative_diff=-0.0025,
-                               p_value=0.4, ci_lower=-3.0, ci_upper=2.0, is_significant=False),
+                              p_value=0.4, ci_lower=-3.0, ci_upper=2.0, is_significant=False),
             "sec_0": dict(mean_control=1.0, mean_treatment=1.2, relative_diff=0.2,
                           p_value=0.03, ci_lower=0.01, ci_upper=0.3, is_significant=True),
             "sec_1": dict(mean_control=1.0, mean_treatment=1.01, relative_diff=0.01,
@@ -257,20 +255,20 @@ class TestOrchestratorDecisionStatuses:
         n_dup = 20000
         dup_ids = np.arange(n_single, n_single + n_dup)
         dup_control = pd.DataFrame({"user_id": dup_ids, "variant": "control",
-                                     "revenue": rng.normal(100, 10, n_dup), "latency_0": rng.normal(200, 5, n_dup)})
+                                    "revenue": rng.normal(100, 10, n_dup), "latency_0": rng.normal(200, 5, n_dup)})
         dup_treat = pd.DataFrame({"user_id": dup_ids, "variant": "t1",
-                                   "revenue": rng.normal(100, 10, n_dup), "latency_0": rng.normal(200, 5, n_dup)})
+                                  "revenue": rng.normal(100, 10, n_dup), "latency_0": rng.normal(200, 5, n_dup)})
         n_extra = 1000
         extra_ids = np.arange(n_single + n_dup, n_single + n_dup + n_extra)
         extra_rows = pd.DataFrame({"user_id": extra_ids, "variant": "control",
-                                    "revenue": rng.normal(100, 10, n_extra), "latency_0": rng.normal(200, 5, n_extra)})
+                                   "revenue": rng.normal(100, 10, n_extra), "latency_0": rng.normal(200, 5, n_extra)})
         df_full = pd.concat([df_single, dup_control, dup_treat, extra_rows], ignore_index=True)
 
         scenario = {
             "revenue": dict(mean_control=100.0, mean_treatment=103.0, relative_diff=0.03,
-                             p_value=0.001, ci_lower=1.0, ci_upper=5.0, is_significant=True),
+                            p_value=0.001, ci_lower=1.0, ci_upper=5.0, is_significant=True),
             "latency_0": dict(mean_control=200.0, mean_treatment=199.5, relative_diff=-0.0025,
-                               p_value=0.4, ci_lower=-3.0, ci_upper=2.0, is_significant=False),
+                              p_value=0.4, ci_lower=-3.0, ci_upper=2.0, is_significant=False),
         }
         with mock.patch.object(SmartABPlatformOrchestrator, "_evaluate_pair_metric", _fake_pair_metric(scenario)):
             report = SmartABPlatformOrchestrator.evaluate_experiment(passport, df_full)
@@ -289,9 +287,9 @@ class TestOrchestratorDecisionStatuses:
         assert "pre_revenue" not in df.columns
         scenario = {
             "revenue": dict(mean_control=100.0, mean_treatment=103.0, relative_diff=0.03,
-                             p_value=0.001, ci_lower=1.0, ci_upper=5.0, is_significant=True),
+                            p_value=0.001, ci_lower=1.0, ci_upper=5.0, is_significant=True),
             "latency_0": dict(mean_control=200.0, mean_treatment=199.5, relative_diff=-0.0025,
-                               p_value=0.4, ci_lower=-3.0, ci_upper=2.0, is_significant=False),
+                              p_value=0.4, ci_lower=-3.0, ci_upper=2.0, is_significant=False),
         }
         with mock.patch.object(SmartABPlatformOrchestrator, "_evaluate_pair_metric", _fake_pair_metric(scenario)):
             report = SmartABPlatformOrchestrator.evaluate_experiment(passport, df)
