@@ -20,14 +20,32 @@ class CausalAndMLDebiasingEngine:
         feature_cols: List[str],
         variant_col: str = "variant",
         alpha: float = 0.05,
+        control_id: str = "control",
+        treatment_id: str = "treatment",
     ) -> dict:
+        """
+        K5: имена групп задаются явно (из Паспорта). Если в данных есть другие варианты,
+        функция не отбрасывает их молча, а требует отфильтровать пару для сравнения.
+        """
+        observed = set(df[variant_col].unique())
+        missing = {control_id, treatment_id} - observed
+        if missing:
+            raise ValueError(f"В '{variant_col}' нет вариантов {sorted(missing)}; есть {sorted(map(str, observed))}")
+        extra = observed - {control_id, treatment_id}
+        if extra:
+            raise ValueError(
+                f"В данных есть другие варианты {sorted(map(str, extra))}: многорукий тест анализируется "
+                "попарно — отфильтруйте пару (control, treatment) перед вызовом"
+            )
         data = df.copy()
         X_all = data[feature_cols].to_numpy(dtype=float)
         X_mean = np.mean(X_all, axis=0)
         X_centered = X_all - X_mean
 
-        c_mask = (data[variant_col] == "control").to_numpy()
-        t_mask = (data[variant_col] == "treatment").to_numpy()
+        c_mask = (data[variant_col] == control_id).to_numpy()
+        t_mask = (data[variant_col] == treatment_id).to_numpy()
+        if c_mask.sum() < 2 or t_mask.sum() < 2:
+            raise ValueError("В каждой группе нужно минимум 2 наблюдения")
 
         y_c = data.loc[c_mask, outcome_col].to_numpy(dtype=float)
         y_t = data.loc[t_mask, outcome_col].to_numpy(dtype=float)
@@ -52,7 +70,7 @@ class CausalAndMLDebiasingEngine:
         ate = float(np.mean(y_t_adj) - np.mean(y_c_adj))
         se_adj = math.sqrt(max(var_adj, 1e-15))
         z_stat = ate / se_adj
-        p_val = float(2.0 * (1.0 - stats.norm.cdf(abs(z_stat))))
+        p_val = float(2.0 * stats.norm.sf(abs(z_stat)))
 
         return {
             "ate_debiased": ate,
