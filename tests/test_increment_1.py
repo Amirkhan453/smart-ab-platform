@@ -64,12 +64,20 @@ def test_sutva_network_effects_rejection():
         ExperimentPassport(**data)
 
 
-def test_short_duration_seasonality_rejection():
-    """Проверка, что платформа блокирует тесты короче 7 дней (защита от недельной сезонности)."""
+@pytest.mark.parametrize("days", [3, 10])
+def test_short_duration_seasonality_rejection(days):
+    """Длительность должна быть целым числом полных недель: 3 и 10 дней отклоняются."""
     data = get_valid_passport_dict()
-    data["planned_duration_days"] = 3
-    with pytest.raises(ValueError, match="минимум 7 дней"):
+    data["planned_duration_days"] = days
+    with pytest.raises(ValueError, match="целое число полных недель"):
         ExperimentPassport(**data)
+
+
+def test_passport_is_immutable():
+    """Паспорт frozen: изменение поля после создания запрещено (нужна новая версия)."""
+    passport = ExperimentPassport(**get_valid_passport_dict())
+    with pytest.raises(Exception):
+        passport.planned_duration_days = 21
 
 
 def test_cuped_sample_size_reduction():

@@ -1,7 +1,9 @@
+import hashlib
+import json
 from datetime import datetime, timezone
 from enum import Enum
 from typing import List, Literal, Optional
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class ExperimentType(str, Enum):
@@ -10,7 +12,7 @@ class ExperimentType(str, Enum):
     SWITCHBACK = "switchback"
     GEO_EXPERIMENT = "geo_experiment"
     QUASI_EXPERIMENT = "quasi_experiment"
-    BANDIT = "multi_armed_bandit"
+    # BANDIT исключён в v2.1: многорукие бандиты вне границ текущей версии платформы.
 
 
 class RandomizationUnit(str, Enum):
@@ -45,6 +47,7 @@ class Direction(str, Enum):
 
 
 class MetricDefinition(BaseModel):
+    """Строгое определение метрики до старта теста (защита от p-hacking и cherry-picking)."""
     name: str = Field(..., min_length=1, description="Системное имя метрики")
     metric_type: MetricType
     numerator_col: str = Field(..., min_length=1, description="Колонка числителя или самой метрики в БД")
@@ -66,6 +69,7 @@ class MetricDefinition(BaseModel):
 
 
 class GuardrailDefinition(BaseModel):
+    """Защитная метрика с жестким числовым порогом деградации для авто-остановки теста."""
     metric: MetricDefinition
     max_allowed_degradation_rel: float = Field(
         ..., gt=0.0, description="Максимально допустимое относительное ухудшение (например, 0.02 = 2%)"
@@ -83,6 +87,7 @@ class VariantAllocation(BaseModel):
 
 
 class RiskProfile(BaseModel):
+    """Профиль бизнес-рисков, заполняемый ИИ-ассистентом при интервьюировании."""
     has_network_effects: bool = False
     has_cannibalization_risk: bool = False
     reaction_lag_days: int = Field(0, ge=0)
@@ -90,11 +95,29 @@ class RiskProfile(BaseModel):
 
 
 class ExperimentPassport(BaseModel):
+    """
+    Главный неизменяемый контракт эксперимента (Pre-Registration Lock).
+    Фиксирует гипотезу, варианты, слои, метрики и настройки CUPED ещё ДО запуска теста.
+
+    Модель immutable (frozen=True): любое изменение параметров после создания
+    Паспорта требует новой версии (`version`), а не мутации существующего
+    объекта. Целостность версии подтверждается хэшем `passport_hash`,
+    вычисляемым методом `compute_hash()` по канонической JSON-сериализации
+    всех полей, кроме самого хэша, `status` и `created_at`.
+    """
+    model_config = ConfigDict(frozen=True)
+
     experiment_id: str = Field(..., min_length=1)
+    project_id: str = Field("default", min_length=1, description="Идентификатор арендатора/проекта (задел под multi-tenant)")
+    version: int = Field(1, ge=1, description="Версия Паспорта; новая версия при любом изменении после Approved")
+    status: str = Field(
+        "draft",
+        description="draft | review | approved | running | paused | stopped | analysis | decision | archived",
+    )
+    passport_hash: Optional[str] = Field(
+        None, description="SHA-256 хэш канонической версии Паспорта; вычисляется методом compute_hash()"
+    )
     test_key: str = Field(..., min_length=1, description="Уникальный ключ фичи для ортогонального хэширования")
-    project_id: str = Field("default", min_length=1)
-    version: int = Field(1, ge=1)
-    status: str = Field("draft")
     layer_id: str = Field("default_layer", min_length=1, description="Слой (Plane) для изоляции экспериментов")
     layer_slot_start: int = Field(0, ge=0, lt=10000, description="Начальный бакет-слот в слое [0..10000)")
     layer_slot_end: int = Field(10000, gt=0, le=10000, description="Конечный бакет-слот в слое (0..10000]")
@@ -118,24 +141,34 @@ class ExperimentPassport(BaseModel):
     use_cuped: bool = True
     use_lins_method: bool = False
     covariate_col: Optional[str] = Field("pre_revenue", description="Колонка пред-периода для CUPED")
-    cuped_min_r2: float = Field(0.05, ge=0.0, lt=1.0, description="Минимальный порог r^2 для применения CUPED")
-    pre_period_window_days: int = Field(14, ge=1)
+    cuped_min_r2: float = Field(0.05, ge=0.0, lt=1.0, description="Минимальный R^2 ковариаты для применения CUPED")
+    pre_period_window_days: int = Field(14, ge=1, description="Длина пре-периода для ковариаты CUPED, дней")
 
     baseline_value: float = Field(..., gt=0.0, description="Историческое базовое значение целевой метрики")
     mde_relative: float = Field(..., gt=0.0, description="Минимально детектируемый относительный эффект")
-    practical_significance_threshold: float = Field(0.0, ge=0.0, description="Порог практической значимости")
     alpha: float = Field(0.05, gt=0.0, lt=0.5, description="Ошибка I рода (FPR)")
     power: float = Field(0.80, gt=0.5, lt=0.999, description="Статистическая мощность (1 - Beta)")
-    srm_alpha: float = Field(0.001, gt=0.0, lt=0.5, description="Порог значимости для критерия Хи-квадрат SRM")
-    analysis_mode: Literal["fixed_horizon", "sequential"] = "fixed_horizon"
-    sidedness: Literal["two_sided", "one_sided"] = "two_sided"
-    stratification_cols: List[str] = Field(default_factory=list)
+    sidedness: Literal["two_sided", "one_sided"] = Field(
+        "two_sided", description="Сторонность теста для primary-метрики"
+    )
+    analysis_mode: Literal["fixed_horizon", "sequential"] = Field(
+        "fixed_horizon", description="Режим просмотра результатов: фиксированный горизонт или sequential/always-valid"
+    )
+    practical_significance_threshold: float = Field(
+        0.0, ge=0.0, description="Минимальный относительный эффект, который считается практически значимым"
+    )
+    srm_alpha: float = Field(0.001, gt=0.0, lt=0.5, description="Порог значимости хи-квадрат теста SRM")
 
     planned_duration_days: int = Field(..., ge=1, description="Планируемая длительность теста в днях")
-    maturation_days: int = Field(0, ge=0)
-    attribution_window_days: int = Field(7, ge=1)
     daily_eligible_units: int = Field(..., gt=0, description="Доступный трафик единиц рандомизации в день")
     allow_short_duration_override: bool = False
+    maturation_days: int = Field(0, ge=0, description="Период дозревания метрик после старта, дней")
+    attribution_window_days: int = Field(7, ge=0, description="Окно атрибуции конверсии к показу, дней")
+
+    stratification_cols: List[str] = Field(default_factory=list, description="Колонки страт для блочной рандомизации")
+    bot_max_events_per_unit: Optional[int] = Field(
+        None, gt=0, description="Порог числа событий на единицу рандомизации для variant-blind фильтрации ботов"
+    )
 
     risk_profile: RiskProfile = Field(default_factory=RiskProfile)
 
@@ -167,7 +200,7 @@ class ExperimentPassport(BaseModel):
         ):
             raise ValueError(
                 "Методологическая ошибка (SUTVA Violation): При наличии сетевых эффектов "
-                "классический поюзерный A/B даст смещенный результат. "
+                "классический поюзерный A/B даст смещённый результат. "
                 "Используйте experiment_type='switchback', 'cluster_ab' или 'geo_experiment'."
             )
 
@@ -181,11 +214,12 @@ class ExperimentPassport(BaseModel):
                 f"({self.analysis_unit.value}). Целевая метрика должна иметь тип RATIO."
             )
 
-        if self.planned_duration_days < 7 and not self.allow_short_duration_override:
-            raise ValueError(
-                f"Задана длительность {self.planned_duration_days} дн. Тест должен идти минимум 7 дней "
-                "(полный недельный цикл) для исключения эффекта дня недели."
-            )
+        if not self.allow_short_duration_override:
+            if self.planned_duration_days < 7 or self.planned_duration_days % 7 != 0:
+                raise ValueError(
+                    f"Задана длительность {self.planned_duration_days} дн. Тест должен идти целое число "
+                    "полных недель (7, 14, 21, ...) для исключения эффекта дня недели."
+                )
 
         if self.risk_profile.novelty_effect_expected and self.planned_duration_days < 14:
             raise ValueError(
@@ -200,3 +234,19 @@ class ExperimentPassport(BaseModel):
             )
 
         return self
+
+    def compute_hash(self) -> str:
+        """
+        SHA-256 от канонической JSON-сериализации Паспорта без полей
+        passport_hash, status и created_at (они не относятся к идентичности
+        зафиксированного дизайна эксперимента).
+        """
+        payload = self.model_dump(mode="json", exclude={"passport_hash", "status", "created_at"})
+        canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    def locked(self) -> "ExperimentPassport":
+        """Возвращает новую версию Паспорта со статусом 'approved' и проставленным passport_hash."""
+        sealed = self.model_copy(update={"status": "approved"})
+        final_hash = sealed.compute_hash()
+        return sealed.model_copy(update={"passport_hash": final_hash})

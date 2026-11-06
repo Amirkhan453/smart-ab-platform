@@ -42,7 +42,6 @@ class CopilotSessionState:
             ExperimentType.SWITCHBACK,
             ExperimentType.GEO_EXPERIMENT,
             ExperimentType.QUASI_EXPERIMENT,
-            ExperimentType.BANDIT,
         }
     )
     warnings: List[str] = field(default_factory=list)
@@ -113,11 +112,6 @@ class ArborDecisionCopilot:
                 question_prompt="Рекомендован Кластерный A/B-тест (рандомизация по кластерам/B2B-аккаунтам) с оценкой дисперсии через Дельта-метод или CR2.",
                 is_terminal=True,
             ),
-            "terminal_bandit": ArborNode(
-                node_id="terminal_bandit",
-                question_prompt="Рекомендован Многорукий Бандит (Thompson Sampling / Contextual Bandit) для минимизации упущенной выгоды (regret).",
-                is_terminal=True,
-            ),
             "terminal_classic_ab": ArborNode(
                 node_id="terminal_classic_ab",
                 question_prompt="Рекомендован Классический поюзерный A/B-тест с хэшированием MurmurHash3 и снижением дисперсии CUPED/Lin.",
@@ -174,17 +168,13 @@ class ArborDecisionCopilot:
                 condition_description="Социальный граф, B2B-организации или изолированные кластеры юзеров",
                 predicate=lambda ctx: ctx.get("interference_type") == "social_or_b2b_cluster",
             ),
-            ArborEdge(
-                source_node="node_traffic_and_goal_check",
-                target_node="terminal_bandit",
-                condition_description="Короткая кампания / мало трафика для мелкого MDE / цель — максимизация выгоды на лету",
-                predicate=lambda ctx: ctx.get("prefer_regret_minimization") is True,
-            ),
+            # Бандиты вне границ платформы (ТЗ v4, раздел 1.2): при любом ответе о цели
+            # рекомендуется классический A/B; запрос на минимизацию regret даёт предупреждение.
             ArborEdge(
                 source_node="node_traffic_and_goal_check",
                 target_node="terminal_classic_ab",
                 condition_description="Нужно строгое статистическое доказательство эффекта (научный вывод)",
-                predicate=lambda ctx: ctx.get("prefer_regret_minimization") is False,
+                predicate=lambda ctx: ctx.get("prefer_regret_minimization") in (True, False),
             ),
         ]
 
@@ -261,7 +251,6 @@ class ArborDecisionCopilot:
             "terminal_geo": (ExperimentType.GEO_EXPERIMENT, RandomizationUnit.STORE_ID),
             "terminal_switchback": (ExperimentType.SWITCHBACK, RandomizationUnit.CLUSTER_TIME_CELL),
             "terminal_cluster": (ExperimentType.CLUSTER_AB, RandomizationUnit.B2B_ACCOUNT_ID),
-            "terminal_bandit": (ExperimentType.BANDIT, RandomizationUnit.USER_ID),
             "terminal_classic_ab": (ExperimentType.CLASSIC_AB, RandomizationUnit.USER_ID),
         }
         if reached_node in terminal_map:
@@ -276,7 +265,7 @@ class ArborDecisionCopilot:
         elif reached_node == "node_interference_structure":
             state.candidate_designs = {ExperimentType.SWITCHBACK, ExperimentType.CLUSTER_AB}
         elif reached_node == "node_traffic_and_goal_check":
-            state.candidate_designs = {ExperimentType.CLASSIC_AB, ExperimentType.BANDIT}
+            state.candidate_designs = {ExperimentType.CLASSIC_AB}
 
     def _evaluate_business_risks(self, state: CopilotSessionState) -> None:
         ctx = state.collected_context
@@ -287,6 +276,12 @@ class ArborDecisionCopilot:
             warnings.append(
                 "Эвристика масштаба (Kohavi Rule): При аудитории <200 000 юзеров детектировать мелкие эффекты (<5%) "
                 "в классическом A/B нерентабельно. Сфокусируйтесь на крупных изменениях (MDE 5-15%) или включите CUPED."
+            )
+
+        if ctx.get("prefer_regret_minimization") is True:
+            warnings.append(
+                "Многорукие бандиты вне границ платформы: рекомендован классический A/B. "
+                "Если трафика мало для нужного MDE, увеличьте длительность, MDE или используйте CUPED."
             )
 
         if ctx.get("has_cannibalization_risk"):

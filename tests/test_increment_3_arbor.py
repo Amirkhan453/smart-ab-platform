@@ -58,3 +58,20 @@ def test_linkedin_site_wide_impact_calculation():
     )
     assert swi["local_lift_pct"] == 5.0
     assert swi["site_wide_impact_pct"] == 1.0
+
+
+def test_arbor_regret_request_routes_to_classic_ab_with_warning():
+    """Бандиты вне границ платформы: запрос на минимизацию regret ведёт к классическому A/B с предупреждением."""
+    copilot = ArborDecisionCopilot()
+    state = copilot.advance_tree(
+        CopilotSessionState(),
+        {
+            "can_randomize": True,
+            "is_offline": False,
+            "has_network_effects": False,
+            "prefer_regret_minimization": True,
+        },
+    )
+    assert state.recommended_design == ExperimentType.CLASSIC_AB
+    assert ExperimentType.CLASSIC_AB in state.candidate_designs
+    assert any("бандиты вне границ" in w.lower() for w in state.warnings)

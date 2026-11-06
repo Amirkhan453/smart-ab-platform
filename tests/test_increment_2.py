@@ -25,7 +25,12 @@ def test_cuped_lins_and_power_optimal_weight():
         n_users=5000, true_lift_rel=0.05, pre_post_corr=0.8
     )
 
-    cuped_df, diag = VarianceReductionEngine.apply_cuped(df, "post_revenue", "pre_revenue")
+    # Генератор добавляет выбросы ("китов"), которые без винзоризации снижают фактическую
+    # корреляцию pre/post с 0.8 до ~0.2. В боевом пайплайне винзоризация идёт до CUPED
+    # (orchestrator передаёт winsorize_percentile=0.995), поэтому задаём её явно.
+    cuped_df, diag = VarianceReductionEngine.apply_cuped(
+        df, "post_revenue", "pre_revenue", winsorize_quantile=0.995
+    )
     assert diag["applied"] is True
     assert diag["variance_reduction_pct"] > 50.0
     assert diag["sensitivity_gain_factor"] > 1.4
