@@ -1,14 +1,17 @@
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, List, Optional
+import numpy as np
 import pandas as pd
 
 from ab_platform.schemas.passport import (
     Direction,
+    Domain,
     ExperimentPassport,
     MetricDefinition,
     MetricType,
 )
+from ab_platform.engine import cluster_inference
 from ab_platform.engine.hygiene import DataHygieneProcessor
 from ab_platform.engine.cuped import VarianceReductionEngine
 from ab_platform.engine.criterion_router import StatCriterionRouter
@@ -142,18 +145,67 @@ class SmartABPlatformOrchestrator:
             + [g.metric for g in passport.guardrail_metrics]
             + list(passport.secondary_metrics)
         )
+        clustered = passport.domain in (Domain.RESTAURANT, Domain.RESTAURANT_TIME)
         for m in all_metrics:
             if m.metric_type == MetricType.BINARY:
-                agg_rules[m.numerator_col] = "max"
-            else:
+                agg_rules[m.numerator_col] = "mean" if clustered else "max"
+            elif m.metric_type == MetricType.RATIO:
                 agg_rules[m.numerator_col] = "sum"
+            else:
+                # Ресторан-дни → среднее за день на ресторан (устойчиво к закрытым дням); гость → сумма.
+                agg_rules[m.numerator_col] = "mean" if clustered else "sum"
             if m.denominator_col:
                 agg_rules[m.denominator_col] = "sum"
 
         if covariate_col and covariate_col in df.columns:
             agg_rules[covariate_col] = "first"
+        for col in passport.stratification_cols:
+            if col in df.columns and col not in agg_rules:
+                agg_rules[col] = "first"
 
         return df.groupby([user_col, variant_col], as_index=False).agg(agg_rules)
+
+    @staticmethod
+    def _evaluate_cluster_primary(
+        pair_df: pd.DataFrame,
+        passport: ExperimentPassport,
+        control_id: str,
+        treatment_id: str,
+        variant_col: str,
+        covariate_col: Optional[str],
+    ) -> tuple[Dict[str, Any], Dict[str, Any]]:
+        """
+        Primary ресторанного домена (ТЗ v4, 5.5): строки уже агрегированы до кластера,
+        оценка — cluster_inference по estimand и inference из Паспорта.
+        """
+        metric = passport.primary_metric
+        col = metric.numerator_col
+        clusters = pd.DataFrame({
+            "y": pair_df[col].to_numpy(dtype=float),
+            "treat": (pair_df[variant_col] == treatment_id).astype(int).to_numpy(),
+        })
+        cuped = {"applied": False, "theta": 0.0, "correlation": 0.0,
+                 "variance_reduction_pct": 0.0, "sensitivity_gain_factor": 1.0, "method": "none"}
+        if covariate_col and covariate_col in pair_df.columns:
+            x = pair_df[covariate_col].to_numpy(dtype=float)
+            clusters["x"] = x
+            corr = float(np.corrcoef(clusters["y"], x)[0, 1]) if np.std(x) > 0 else 0.0
+            cuped = {"applied": True, "theta": 0.0, "correlation": corr,
+                     "variance_reduction_pct": round(corr ** 2 * 100.0, 3),
+                     "sensitivity_gain_factor": float(1.0 / np.sqrt(max(1.0 - corr ** 2, 1e-12))),
+                     "method": "lin_regression"}
+        blocks = [c for c in passport.stratification_cols if c in pair_df.columns]
+        if blocks:
+            clusters["block"] = pair_df[blocks].astype(str).agg("|".join, axis=1).to_numpy()
+        res = cluster_inference.analyze_cluster_rct(
+            clusters,
+            estimand=passport.estimand.value,
+            inference=passport.inference.value,
+            alpha=passport.alpha,
+            sidedness=passport.sidedness,
+            direction=metric.expected_direction.value,
+        )
+        return res, cuped
 
     @staticmethod
     def _evaluate_pair_metric(
@@ -391,6 +443,19 @@ class SmartABPlatformOrchestrator:
         for t_alloc in treatment_allocs:
             t_id = t_alloc.variant_id
             pair_df = clean_df[clean_df[variant_col].isin([control_id, t_id])]
+            clustered_primary = (
+                passport.domain in (Domain.RESTAURANT, Domain.RESTAURANT_TIME)
+                and passport.primary_metric.metric_type == MetricType.CONTINUOUS
+            )
+            if clustered_primary:
+                p_res, c_diag = cls._evaluate_cluster_primary(
+                    pair_df, passport, control_id, t_id, variant_col, effective_covariate_col
+                )
+                variant_comparisons[t_id] = p_res
+                cuped_diag_map[t_id] = c_diag
+                arm_pvals.append(p_res["p_value"])
+                arm_ids.append(t_id)
+                continue
             p_res, c_diag = cls._evaluate_pair_metric(
                 df_pair=pair_df,
                 metric_def=passport.primary_metric,

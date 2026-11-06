@@ -404,8 +404,10 @@ class StatCriterionRouter:
                 "Недостаточно кластеров в одной из групп для кластерно-устойчивой оценки (минимум 2)."
             )
 
-        mean_c = float(np.average(c_means, weights=c_counts))
-        mean_t = float(np.average(t_means, weights=t_counts))
+        # Estimand — среднее по кластерам (невзвешенное): та же величина, для которой считается SE.
+        # Раньше разность бралась по взвешенным средним, а SE — по невзвешенным: FPR ≈ 6.4% (Д4).
+        mean_c = float(np.mean(c_means))
+        mean_t = float(np.mean(t_means))
         diff = mean_t - mean_c
 
         var_c_cluster = float(np.var(c_means, ddof=1))
