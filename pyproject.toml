@@ -16,8 +16,12 @@ dependencies = [
     "statsmodels>=0.14.0",
     "streamlit>=1.32.0",
     "pytest>=8.0.0",
+    "pyarrow>=15.0.0",
+    "PyYAML>=6.0",
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+markers = ["slow: полные симуляционные приёмки (тысячи прогонов); запуск: pytest -m slow"]
+addopts = "-m 'not slow'"
