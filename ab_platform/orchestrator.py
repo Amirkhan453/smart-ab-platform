@@ -17,13 +17,21 @@ from ab_platform.copilot.arbor_engine import ArborDecisionCopilot
 
 
 class DecisionStatus(str, Enum):
+    """
+    Вердикт правила решения (ТЗ v4, 5.3). SHIP_CANDIDATE — кандидат на раскатку: финальное
+    решение ставит человек. SHIP_TO_PRODUCTION — устаревший синоним SHIP_CANDIDATE (до фазы 5).
+    """
     INVALID_EXPERIMENT_SRM_OR_CONTAMINATION = "INVALID_EXPERIMENT_SRM_OR_CONTAMINATION"
     DO_NOT_SHIP_GUARDRAIL_BREACH = "DO_NOT_SHIP_GUARDRAIL_BREACH"
-    SHIP_TO_PRODUCTION = "SHIP_TO_PRODUCTION"
+    SHIP_CANDIDATE = "SHIP_CANDIDATE"
+    SHIP_TO_PRODUCTION = "SHIP_CANDIDATE"  # синоним (alias) для обратной совместимости
     DO_NOT_SHIP_PRIMARY_DEGRADED = "DO_NOT_SHIP_PRIMARY_DEGRADED"
     NEUTRAL_NO_SIGNIFICANT_EFFECT = "NEUTRAL_NO_SIGNIFICANT_EFFECT"
+    NEUTRAL_BELOW_PRACTICAL_THRESHOLD = "NEUTRAL_BELOW_PRACTICAL_THRESHOLD"
     INCONCLUSIVE_NEEDS_MORE_DATA = "INCONCLUSIVE_NEEDS_MORE_DATA"
     HOLD_HUMAN_REVIEW_GUARDRAIL_UNCERTAIN = "HOLD_HUMAN_REVIEW_GUARDRAIL_UNCERTAIN"
+    HOLD_HUMAN_REVIEW_EVIDENCE = "HOLD_HUMAN_REVIEW_EVIDENCE"
+    RUNNING_BLINDED = "RUNNING_BLINDED"
 
 
 @dataclass
@@ -74,6 +82,13 @@ class ExperimentEvaluationReport:
     secondary_results: List[SecondaryMetricEvalSummary]
     site_wide_impact: Dict[str, float]
     executive_summary_ru: str
+    evidence_level: str = "A"
+    estimand: str = "itt"
+    generalization_population: str = ""
+    passport_version: int = 1
+    passport_hash: Optional[str] = None
+    analysis_day: Optional[int] = None
+    blinded: bool = False
 
 
 class SmartABPlatformOrchestrator:
@@ -152,7 +167,9 @@ class SmartABPlatformOrchestrator:
         alpha: float = 0.05,
         quantile_target: float = 0.90,
         cuped_min_r2: float = 0.05,
+        sidedness: str = "two_sided",
     ) -> tuple[Dict[str, Any], Dict[str, Any]]:
+        direction = metric_def.expected_direction.value
         work_df = df_pair.copy()
         num_col = metric_def.numerator_col
 
@@ -208,13 +225,13 @@ class SmartABPlatformOrchestrator:
             stat_res = StatCriterionRouter.proportions_z_test(
                 c_df[target_col].to_numpy(dtype=float),
                 t_df[target_col].to_numpy(dtype=float),
-                alpha=alpha,
+                alpha=alpha, sidedness=sidedness, direction=direction,
             )
         elif metric_def.metric_type == MetricType.CONTINUOUS:
             stat_res = StatCriterionRouter.welchs_t_test(
                 c_df[target_col].to_numpy(dtype=float),
                 t_df[target_col].to_numpy(dtype=float),
-                alpha=alpha,
+                alpha=alpha, sidedness=sidedness, direction=direction,
             )
         elif metric_def.metric_type == MetricType.RATIO:
             den_col = metric_def.denominator_col
@@ -225,14 +242,14 @@ class SmartABPlatformOrchestrator:
                 c_df[den_col].to_numpy(dtype=float),
                 t_df[num_col].to_numpy(dtype=float),
                 t_df[den_col].to_numpy(dtype=float),
-                alpha=alpha,
+                alpha=alpha, sidedness=sidedness, direction=direction,
             )
         elif metric_def.metric_type == MetricType.QUANTILE:
             stat_res = StatCriterionRouter.bootstrap_quantile_test(
                 c_df[num_col].to_numpy(dtype=float),
                 t_df[num_col].to_numpy(dtype=float),
                 quantile=quantile_target,
-                alpha=alpha,
+                alpha=alpha, sidedness=sidedness, direction=direction,
             )
         else:
             raise ValueError(f"Неизвестный тип метрики: {metric_def.metric_type}")
@@ -255,7 +272,20 @@ class SmartABPlatformOrchestrator:
         assigned_counts: Optional[tuple[int, int]] = None,
         triggered_share_alpha: float = 1.0,
         secondary_tiers: Optional[Dict[str, int]] = None,
+        analysis_day: Optional[int] = None,
     ) -> ExperimentEvaluationReport:
+        """
+        Правило решения ТЗ v4, 5.3. ``analysis_day`` — день теста на момент анализа: при
+        fixed_horizon и дне меньше planned_duration_days p-value и вердикт по primary скрыты
+        (RUNNING_BLINDED), а SRM и guardrails считаются. ``None`` — финальный анализ.
+        """
+        if analysis_day is not None and analysis_day < 0:
+            raise ValueError("analysis_day не может быть отрицательным.")
+        blinded = bool(
+            analysis_day is not None
+            and passport.analysis_mode == "fixed_horizon"
+            and analysis_day < passport.planned_duration_days
+        )
         effective_use_lin = passport.use_lins_method if use_lins_method is None else use_lins_method
         effective_use_cuped = passport.use_cuped if use_cuped is None else use_cuped
         effective_cuped_min_r2 = passport.cuped_min_r2 if cuped_min_r2 is None else cuped_min_r2
@@ -371,6 +401,7 @@ class SmartABPlatformOrchestrator:
                 use_lins_method=effective_use_lin,
                 alpha=passport.alpha,
                 cuped_min_r2=effective_cuped_min_r2,
+                sidedness=passport.sidedness,
             )
             variant_comparisons[t_id] = p_res
             cuped_diag_map[t_id] = c_diag
@@ -387,7 +418,6 @@ class SmartABPlatformOrchestrator:
         secondary_summaries: List[SecondaryMetricEvalSummary] = []
         breached_arms = set()
         inconclusive_guardrail_arms = set()
-        tier_alpha_map = {1: 0.05, 2: 0.01, 3: 0.001}
         all_secondary_raw: List[tuple] = []
 
         for t_alloc in treatment_allocs:
@@ -403,7 +433,7 @@ class SmartABPlatformOrchestrator:
                     treatment_id=t_id,
                     variant_col=variant_col,
                     covariate_col=None,
-                    alpha=0.05,
+                    alpha=passport.alpha,
                 )
                 higher_is_better = g_def.metric.expected_direction == Direction.INCREASE
                 breach_eval = ExperimentSafeguardEngine.evaluate_guardrail_breach(
@@ -413,11 +443,12 @@ class SmartABPlatformOrchestrator:
                     ci_upper_diff=g_stat["ci_upper"],
                     max_allowed_degradation_rel=g_def.max_allowed_degradation_rel,
                     higher_is_better=higher_is_better,
+                    alpha_guardrail=passport.alpha,
                 )
                 arm_guardrail_evals.append((g_def, g_stat, breach_eval))
 
             breach_pvals = [be["p_value_breach"] for _, _, be in arm_guardrail_evals]
-            holm_rejects = ExperimentSafeguardEngine.apply_holm_to_breach_signals(breach_pvals, alpha=0.05)
+            holm_rejects = ExperimentSafeguardEngine.apply_holm_to_breach_signals(breach_pvals, alpha=passport.alpha)
 
             for (g_def, g_stat, breach_eval), holm_significant in zip(arm_guardrail_evals, holm_rejects):
                 status = breach_eval["status"]
@@ -451,8 +482,9 @@ class SmartABPlatformOrchestrator:
                 )
 
             for sec_def in passport.secondary_metrics:
+                # Тир — метка важности, а не отдельный alpha (ТЗ v4, 5.2): решение только по BH.
                 tier = (secondary_tiers or {}).get(sec_def.name, 2)
-                t_alpha = tier_alpha_map.get(tier, 0.01)
+                t_alpha = passport.alpha
                 s_res, _ = cls._evaluate_pair_metric(
                     df_pair=pair_df,
                     metric_def=sec_def,
@@ -483,7 +515,7 @@ class SmartABPlatformOrchestrator:
                     relative_diff_pct=round(s_res["relative_diff"] * 100.0, 3),
                     p_value=s_res["p_value"],
                     is_significant_fdr=bool(is_sig_fdr),
-                    is_significant_tiered=bool(s_res["p_value"] < t_alpha),
+                    is_significant_tiered=bool(is_sig_fdr),
                 )
             )
 
@@ -501,8 +533,14 @@ class SmartABPlatformOrchestrator:
 
         rel_diff = primary_res["relative_diff"]
         is_positive_move = (rel_diff > 0) if expected_dir == Direction.INCREASE else (rel_diff < 0)
-        primary_won = bool(primary_res["is_significant"] and is_positive_move and (best_arm_id not in breached_arms))
+        primary_significant_positive = bool(
+            primary_res["is_significant"] and is_positive_move and (best_arm_id not in breached_arms)
+        )
+        practical_threshold_for_ship = passport.practical_significance_threshold
+        meets_practical = bool(abs(rel_diff) >= practical_threshold_for_ship)
+        primary_won = primary_significant_positive and meets_practical
         primary_degraded = bool(primary_res["is_significant"] and not is_positive_move)
+        evidence = passport.evidence_level
         any_guardrail_breached = len(breached_arms) == len(arm_ids)
 
         swi = ArborDecisionCopilot.compute_site_wide_impact(
@@ -511,7 +549,7 @@ class SmartABPlatformOrchestrator:
 
         ci_conf_pct = int(round((1.0 - passport.alpha) * 100))
         winning_variant: Optional[str] = None
-        if has_srm or double_exp_frac > 0.05:
+        if has_srm or double_exp_frac > passport.max_double_exposure_share:
             decision_status = DecisionStatus.INVALID_EXPERIMENT_SRM_OR_CONTAMINATION
             can_trust = False
             verdict_ru = (
@@ -527,6 +565,13 @@ class SmartABPlatformOrchestrator:
                 f"критические Guardrail-пороги безопасности по метрикам: [{breached_names}]. "
                 f"Рекомендуется откат (Revert)."
             )
+        elif blinded:
+            decision_status = DecisionStatus.RUNNING_BLINDED
+            can_trust = True
+            verdict_ru = (
+                f"⏳ ТЕСТ ИДЁТ (день {analysis_day} из {passport.planned_duration_days}): p-value и вердикт по "
+                f"целевой метрике скрыты до горизонта (fixed horizon, ТЗ v4 5.4). SRM и guardrails в норме."
+            )
         elif best_arm_id in inconclusive_guardrail_arms:
             decision_status = DecisionStatus.HOLD_HUMAN_REVIEW_GUARDRAIL_UNCERTAIN
             can_trust = True
@@ -539,14 +584,31 @@ class SmartABPlatformOrchestrator:
                 f"'{best_arm_id}' безопасность не доказана и пробой не доказан для метрик: "
                 f"[{inconclusive_names}]. Автоматический SHIP заблокирован."
             )
+        elif primary_won and not passport.auto_ship_allowed:
+            decision_status = DecisionStatus.HOLD_HUMAN_REVIEW_EVIDENCE
+            can_trust = True
+            verdict_ru = (
+                f"🟡 ТРЕБУЕТСЯ РЕШЕНИЕ ЧЕЛОВЕКА (УРОВЕНЬ ДОКАЗАТЕЛЬНОСТИ {evidence.value}): эффект "
+                f"{rel_diff*100:+.2f}% (p-value = {primary_res['p_value']:.4f}) получен без рандомизации "
+                f"(метод: {passport.quasi_method.value if passport.quasi_method else passport.experiment_type.value}). "
+                f"Автоматический SHIP запрещён (ТЗ v4, EVD-1)."
+            )
+        elif primary_significant_positive and not meets_practical:
+            decision_status = DecisionStatus.NEUTRAL_BELOW_PRACTICAL_THRESHOLD
+            can_trust = True
+            verdict_ru = (
+                f"⚪ ЭФФЕКТ ЗНАЧИМ, НО МЕНЬШЕ ПОРОГА ПРАКТИЧЕСКОЙ ЗНАЧИМОСТИ: вариант '{best_arm_id}' дал "
+                f"{rel_diff*100:+.2f}% (p-value = {primary_res['p_value']:.4f}) при пороге "
+                f"{practical_threshold_for_ship*100:.2f}% из Паспорта. Раскатка не рекомендуется."
+            )
         elif primary_won:
-            decision_status = DecisionStatus.SHIP_TO_PRODUCTION
+            decision_status = DecisionStatus.SHIP_CANDIDATE
             can_trust = True
             winning_variant = best_arm_id
             ci_low_pct = (primary_res["ci_lower"] / max(abs(primary_res["mean_control"]), 1e-12)) * 100.0
             ci_high_pct = (primary_res["ci_upper"] / max(abs(primary_res["mean_control"]), 1e-12)) * 100.0
             verdict_ru = (
-                f"✅ РЕКОМЕНДУЕТСЯ К РАСКАТКЕ НА 100% (Вариант '{best_arm_id}'): Целевая метрика "
+                f"✅ КАНДИДАТ НА РАСКАТКУ (Вариант '{best_arm_id}', решение за человеком): Целевая метрика "
                 f"'{passport.primary_metric.name}' статистически значимо улучшилась на {rel_diff*100:+.2f}% "
                 f"({ci_conf_pct}% ДИ: [{ci_low_pct:+.2f}%, {ci_high_pct:+.2f}%], p-value = {primary_res['p_value']:.4f}, "
                 f"критерий: {primary_res['criterion']}, сжатие дисперсии CUPED: {cuped_diag['variance_reduction_pct']:.1f}%). "
@@ -588,6 +650,12 @@ class SmartABPlatformOrchestrator:
                     f"практической значимости ({effective_practical_threshold*100:.2f}%)."
                 )
 
+        if blinded:
+            primary_res = {"blinded": True, "criterion": primary_res.get("criterion")}
+            variant_comparisons = {t_id: {"blinded": True} for t_id in variant_comparisons}
+            secondary_summaries = []
+            winning_variant = None
+
         return ExperimentEvaluationReport(
             experiment_id=passport.experiment_id,
             decision_status=decision_status,
@@ -603,4 +671,11 @@ class SmartABPlatformOrchestrator:
             secondary_results=secondary_summaries,
             site_wide_impact=swi,
             executive_summary_ru=verdict_ru,
+            evidence_level=evidence.value,
+            estimand=passport.estimand.value,
+            generalization_population=passport.generalization_population or "",
+            passport_version=passport.version,
+            passport_hash=passport.passport_hash,
+            analysis_day=analysis_day,
+            blinded=blinded,
         )

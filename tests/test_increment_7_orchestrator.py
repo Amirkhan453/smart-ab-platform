@@ -65,7 +65,7 @@ def _build_sample_passport(primary_type: MetricType = MetricType.CONTINUOUS) -> 
 
 
 def test_orchestrator_end_to_end_winning_ship_decision():
-    """Проверяем полный цикл успешного теста: очистка -> CUPED -> Welch -> Guardrails OK -> SHIP_TO_PRODUCTION."""
+    """Проверяем полный цикл успешного теста: очистка -> CUPED -> Welch -> Guardrails OK -> SHIP_CANDIDATE."""
     passport = _build_sample_passport(MetricType.CONTINUOUS)
     df = SyntheticDataGenerator.generate_ab_dataset(
         n_users=6000, true_lift_rel=0.06, pre_post_corr=0.75, double_exposure_fraction=0.01
@@ -78,11 +78,11 @@ def test_orchestrator_end_to_end_winning_ship_decision():
         covariate_col="pre_revenue",
         triggered_share_alpha=0.50,
     )
-    assert report.decision_status == "SHIP_TO_PRODUCTION"
+    assert report.decision_status == "SHIP_CANDIDATE"
     assert report.can_trust_data is True
     assert report.cuped_diagnostics["applied"] is True
     assert report.cuped_diagnostics["variance_reduction_pct"] > 45.0
-    assert "РЕКОМЕНДУЕТСЯ К РАСКАТКЕ" in report.executive_summary_ru
+    assert "КАНДИДАТ НА РАСКАТКУ" in report.executive_summary_ru
 
 
 def test_orchestrator_blocks_ship_when_guardrail_breached():
@@ -127,4 +127,4 @@ def test_orchestrator_ratio_metric_delta_routing():
 
     report = SmartABPlatformOrchestrator.evaluate_experiment(passport=passport, df=df)
     assert report.primary_metric_result["criterion"] == "ratio_delta_method"
-    assert report.decision_status == "SHIP_TO_PRODUCTION"
+    assert report.decision_status == "SHIP_CANDIDATE"

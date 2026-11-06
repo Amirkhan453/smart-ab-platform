@@ -29,10 +29,31 @@ class StatCriterionRouter:
             raise ValueError(f"Входные массивы для '{label}' содержат значения NaN.")
 
     @staticmethod
-    def _two_tailed_or_one_tailed_normal_p(z: float, sidedness: str) -> float:
+    def _check_side(sidedness: str, direction: str) -> None:
+        if sidedness not in ("two_sided", "one_sided"):
+            raise ValueError(f"sidedness: 'two_sided' или 'one_sided', получено {sidedness!r}")
+        if direction not in ("increase", "decrease"):
+            raise ValueError(f"direction: 'increase' или 'decrease', получено {direction!r}")
+
+    @staticmethod
+    def _two_tailed_or_one_tailed_normal_p(z: float, sidedness: str, direction: str = "increase") -> float:
+        """Односторонний тест проверяет ожидаемую сторону: рост (increase) или снижение (decrease)."""
         if sidedness == "one_sided":
-            return float(stats.norm.sf(z))
+            return float(stats.norm.sf(z if direction == "increase" else -z))
         return float(2.0 * stats.norm.sf(abs(z)))
+
+    @staticmethod
+    def _crit_quantile(alpha: float, sidedness: str) -> float:
+        """Квантиль для ДИ: двусторонний (1 - alpha) или (1 - 2alpha), чья нужная граница = односторонняя."""
+        return 1.0 - alpha / 2.0 if sidedness == "two_sided" else 1.0 - alpha
+
+    @staticmethod
+    def _degenerate_p(diff: float, sidedness: str, direction: str) -> float:
+        """p-value при нулевой дисперсии в обеих группах."""
+        if sidedness == "one_sided":
+            signed = diff if direction == "increase" else -diff
+            return 0.0 if signed > 1e-12 else (1.0 if signed < -1e-12 else 0.5)
+        return 1.0 if abs(diff) < 1e-12 else 0.0
 
     @classmethod
     def welchs_t_test(
@@ -41,7 +62,9 @@ class StatCriterionRouter:
         treatment_vals: np.ndarray,
         alpha: float = 0.05,
         sidedness: Literal["two_sided", "one_sided"] = "two_sided",
+        direction: Literal["increase", "decrease"] = "increase",
     ) -> dict:
+        cls._check_side(sidedness, direction)
         c = np.asarray(control_vals, dtype=float)
         t = np.asarray(treatment_vals, dtype=float)
         cls._validate_two_samples(c, t, "welchs_t_test")
@@ -55,11 +78,8 @@ class StatCriterionRouter:
         if var_c < 1e-15 and var_t < 1e-15:
             se_diff = 0.0
             t_stat = 0.0
-            if sidedness == "one_sided":
-                p_val = 0.0 if diff > 1e-12 else (1.0 if diff < -1e-12 else 0.5)
-            else:
-                p_val = 1.0 if abs(diff) < 1e-12 else 0.0
-            z_crit = float(stats.norm.ppf(1.0 - alpha / 2.0))
+            p_val = cls._degenerate_p(diff, sidedness, direction)
+            z_crit = float(stats.norm.ppf(cls._crit_quantile(alpha, sidedness)))
         else:
             se_diff = math.sqrt((var_c / n_c) + (var_t / n_t))
             t_stat = diff / se_diff if se_diff > 1e-15 else 0.0
@@ -67,14 +87,15 @@ class StatCriterionRouter:
                 (var_c / n_c) ** 2 / max(n_c - 1, 1) + (var_t / n_t) ** 2 / max(n_t - 1, 1)
             )
             if sidedness == "one_sided":
-                p_val = float(stats.t.sf(t_stat, df_welch))
+                p_val = float(stats.t.sf(t_stat if direction == "increase" else -t_stat, df_welch))
             else:
                 p_val = float(2.0 * stats.t.sf(abs(t_stat), df_welch))
-            z_crit = float(stats.t.ppf(1.0 - alpha / 2.0, df_welch))
+            z_crit = float(stats.t.ppf(cls._crit_quantile(alpha, sidedness), df_welch))
 
         return {
             "criterion": "welchs_t_test",
             "sidedness": sidedness,
+            "direction": direction,
             "p_value": p_val,
             "statistic": t_stat,
             "mean_control": mean_c,
@@ -104,7 +125,9 @@ class StatCriterionRouter:
         treatment_binary: np.ndarray,
         alpha: float = 0.05,
         sidedness: Literal["two_sided", "one_sided"] = "two_sided",
+        direction: Literal["increase", "decrease"] = "increase",
     ) -> dict:
+        cls._check_side(sidedness, direction)
         c = np.asarray(control_binary, dtype=float)
         t = np.asarray(treatment_binary, dtype=float)
         cls._validate_two_samples(c, t, "proportions_z_test")
@@ -121,11 +144,11 @@ class StatCriterionRouter:
 
         if small_n:
             table = [[int(round(conv_t)), int(round(n_t - conv_t))], [int(round(conv_c)), int(round(n_c - conv_c))]]
-            fisher_alt = "two-sided" if sidedness == "two_sided" else "greater"
+            fisher_alt = "two-sided" if sidedness == "two_sided" else ("greater" if direction == "increase" else "less")
             _, p_val = stats.fisher_exact(table, alternative=fisher_alt)
             p_val = float(p_val)
 
-            conf_level = 1.0 - alpha
+            conf_level = 1.0 - alpha if sidedness == "two_sided" else 1.0 - 2.0 * alpha
             l_c, u_c = cls._wilson_ci(conv_c, n_c, conf_level)
             l_t, u_t = cls._wilson_ci(conv_t, n_t, conf_level)
             ci_lower = diff - math.sqrt((cr_t - l_t) ** 2 + (u_c - cr_c) ** 2)
@@ -134,6 +157,7 @@ class StatCriterionRouter:
             return {
                 "criterion": "fisher_exact_wilson_ci",
                 "sidedness": sidedness,
+                "direction": direction,
                 "p_value": p_val,
                 "statistic": float("nan"),
                 "mean_control": cr_c,
@@ -153,15 +177,16 @@ class StatCriterionRouter:
         else:
             pooled_se = math.sqrt(pooled_p * (1.0 - pooled_p) * (1.0 / n_c + 1.0 / n_t))
             z_score = diff / pooled_se if pooled_se > 0 else 0.0
-            p_val = cls._two_tailed_or_one_tailed_normal_p(z_score, sidedness)
+            p_val = cls._two_tailed_or_one_tailed_normal_p(z_score, sidedness, direction)
             se_unpooled = math.sqrt(
                 max((cr_c * (1.0 - cr_c) / n_c) + (cr_t * (1.0 - cr_t) / n_t), 0.0)
             )
 
-        z_crit = float(stats.norm.ppf(1.0 - alpha / 2.0))
+        z_crit = float(stats.norm.ppf(cls._crit_quantile(alpha, sidedness)))
         return {
             "criterion": "proportions_z_test",
             "sidedness": sidedness,
+            "direction": direction,
             "p_value": p_val,
             "statistic": float(z_score),
             "mean_control": cr_c,
@@ -182,7 +207,9 @@ class StatCriterionRouter:
         den_t: np.ndarray,
         alpha: float = 0.05,
         sidedness: Literal["two_sided", "one_sided"] = "two_sided",
+        direction: Literal["increase", "decrease"] = "increase",
     ) -> dict:
+        cls._check_side(sidedness, direction)
         nc = np.asarray(num_c, dtype=float)
         dc = np.asarray(den_c, dtype=float)
         nt = np.asarray(num_t, dtype=float)
@@ -211,18 +238,16 @@ class StatCriterionRouter:
         se_diff = math.sqrt(var_r_c + var_r_t)
         if se_diff < 1e-15:
             z_stat = 0.0
-            if sidedness == "one_sided":
-                p_val = 0.0 if diff > 1e-12 else (1.0 if diff < -1e-12 else 0.5)
-            else:
-                p_val = 1.0 if abs(diff) < 1e-12 else 0.0
+            p_val = cls._degenerate_p(diff, sidedness, direction)
         else:
             z_stat = diff / se_diff
-            p_val = cls._two_tailed_or_one_tailed_normal_p(z_stat, sidedness)
+            p_val = cls._two_tailed_or_one_tailed_normal_p(z_stat, sidedness, direction)
 
-        z_crit = float(stats.norm.ppf(1.0 - alpha / 2.0))
+        z_crit = float(stats.norm.ppf(cls._crit_quantile(alpha, sidedness)))
         return {
             "criterion": "ratio_delta_method",
             "sidedness": sidedness,
+            "direction": direction,
             "p_value": p_val,
             "statistic": float(z_stat),
             "mean_control": r_c,
@@ -257,7 +282,10 @@ class StatCriterionRouter:
         n_boot: int = 2000,
         alpha: float = 0.05,
         random_seed: int = 42,
+        sidedness: Literal["two_sided", "one_sided"] = "two_sided",
+        direction: Literal["increase", "decrease"] = "increase",
     ) -> dict:
+        cls._check_side(sidedness, direction)
         c = np.asarray(control_vals, dtype=float)
         t = np.asarray(treatment_vals, dtype=float)
         cls._validate_two_samples(c, t, "bootstrap_quantile_test")
@@ -275,15 +303,22 @@ class StatCriterionRouter:
         boot_q_t = cls._poisson_bootstrap_quantiles(t, quantile, n_boot, rng)
         boot_diffs = boot_q_t - boot_q_c
 
-        ci_lower = float(np.quantile(boot_diffs, alpha / 2.0))
-        ci_upper = float(np.quantile(boot_diffs, 1.0 - alpha / 2.0))
+        q_hi = cls._crit_quantile(alpha, sidedness)
+        ci_lower = float(np.quantile(boot_diffs, 1.0 - q_hi))
+        ci_upper = float(np.quantile(boot_diffs, q_hi))
 
         k_left = float(np.sum(boot_diffs <= 0.0))
         k_right = float(np.sum(boot_diffs >= 0.0))
-        p_val = min(1.0, 2.0 * (min(k_left, k_right) + 1.0) / (n_boot + 1.0))
+        if sidedness == "one_sided":
+            k_against = k_left if direction == "increase" else k_right
+            p_val = min(1.0, (k_against + 1.0) / (n_boot + 1.0))
+        else:
+            p_val = min(1.0, 2.0 * (min(k_left, k_right) + 1.0) / (n_boot + 1.0))
 
         return {
             "criterion": f"bootstrap_q{int(quantile * 100)}",
+            "sidedness": sidedness,
+            "direction": direction,
             "p_value": p_val,
             "statistic": obs_diff,
             "mean_control": q_c,
@@ -292,7 +327,7 @@ class StatCriterionRouter:
             "relative_diff": (obs_diff / q_c) if abs(q_c) > 1e-12 else 0.0,
             "ci_lower": ci_lower,
             "ci_upper": ci_upper,
-            "is_significant": bool(ci_lower > 0.0 or ci_upper < 0.0),
+            "is_significant": bool(p_val < alpha),
         }
 
     @staticmethod

@@ -110,7 +110,7 @@ def test_multi_arm_experiment_evaluation_and_holm_correction():
     report = SmartABPlatformOrchestrator.evaluate_experiment(
         passport_multi, df_multi, covariate_col="pre_revenue"
     )
-    assert report.decision_status == "SHIP_TO_PRODUCTION"
+    assert report.decision_status == "SHIP_CANDIDATE"
     assert report.winning_variant == "treatment_2"
     assert report.variant_comparisons["treatment_1"]["is_significant"] is False
     assert report.variant_comparisons["treatment_2"]["is_significant"] is True

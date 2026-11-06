@@ -74,7 +74,8 @@ def _make_df(n=2000, seed=1, n_secondary=0):
 
 def _fake_pair_metric(scenario):
     def fake(cls, df_pair, metric_def, control_id, treatment_id, variant_col="variant",
-             covariate_col=None, use_lins_method=False, alpha=0.05, quantile_target=0.9, cuped_min_r2=0.05):
+             covariate_col=None, use_lins_method=False, alpha=0.05, quantile_target=0.9, cuped_min_r2=0.05,
+             **kwargs):
         cfg = scenario[metric_def.name]
         stat_res = dict(cfg)
         stat_res.setdefault("criterion", "welch_t_test")

@@ -469,7 +469,7 @@ with tab5:
             triggered_share_alpha=trig_share,
         )
 
-        if report.decision_status == "SHIP_TO_PRODUCTION":
+        if report.decision_status == "SHIP_CANDIDATE":
             st.success(report.executive_summary_ru)
         elif "INVALID" in report.decision_status or "BREACH" in report.decision_status or "DEGRADED" in report.decision_status:
             st.error(report.executive_summary_ru)
