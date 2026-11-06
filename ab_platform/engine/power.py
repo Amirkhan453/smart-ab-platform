@@ -98,7 +98,7 @@ class PowerAndSampleSizeEngine:
         mde_absolute: Optional[float] = None,
         metric_variance: Optional[float] = None,
         is_binary: bool = False,
-        binary_method: Literal["evan_miller", "pooled", "baseline"] = "evan_miller",
+        binary_method: Literal["matched_z_test", "evan_miller", "pooled", "baseline"] = "matched_z_test",
         expected_direction: Direction = Direction.INCREASE,
         alpha: float = 0.05,
         power: float = 0.80,
@@ -183,20 +183,27 @@ class PowerAndSampleSizeEngine:
             raw_variance = p1 * (1.0 - p1)
             effective_variance = raw_variance * cuped_factor * design_effect
 
-            if binary_method == "evan_miller":
-                sd1 = math.sqrt(2.0 * p1 * (1.0 - p1) * cuped_factor * design_effect)
+            if binary_method in ("evan_miller", "matched_z_test"):
+                # evan_miller — дисперсия при H0 по baseline p1 (как калькулятор Evan Miller, для сверки);
+                # matched_z_test — по объединённой p̄, как z-тест анализа (proportions_z_test).
+                # С p1 выборка занижена ≈ на 2,5%: мощность 78,9% вместо 80% (симуляция, фаза 1 П5).
+                p_null = p1 if binary_method == "evan_miller" else (p1 + p2) / 2.0
+                sd1 = math.sqrt(2.0 * p_null * (1.0 - p_null) * cuped_factor * design_effect)
                 sd2 = math.sqrt((p1 * (1.0 - p1) + p2 * (1.0 - p2)) * cuped_factor * design_effect)
                 n_equal_per_var = ((z_alpha * sd1 + z_beta * sd2) ** 2) / (mde_abs ** 2)
                 total_n_float = n_equal_per_var * num_variants * (allocation_multiplier / 4.0)
-                formula_used = "evan_miller_exact_two_proportion"
+                formula_used = ("evan_miller_exact_two_proportion" if binary_method == "evan_miller"
+                                else "two_proportion_pooled_null_matched_to_z_test")
             elif binary_method == "pooled":
                 p_pooled = (p1 + p2) / 2.0
                 pooled_var = p_pooled * (1.0 - p_pooled) * cuped_factor * design_effect
                 total_n_float = ((z_alpha + z_beta) ** 2) * pooled_var * allocation_multiplier / (mde_abs ** 2)
                 formula_used = "pooled_two_proportion"
-            else:
+            elif binary_method == "baseline":
                 total_n_float = ((z_alpha + z_beta) ** 2) * effective_variance * allocation_multiplier / (mde_abs ** 2)
                 formula_used = "baseline_variance_z_test"
+            else:
+                raise ValueError(f"Неизвестный binary_method {binary_method!r}")
         else:
             if metric_variance is None or metric_variance <= 0:
                 raise ValueError("Для непрерывной или Ratio-метрики необходимо передать metric_variance > 0.")
