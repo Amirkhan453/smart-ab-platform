@@ -247,7 +247,14 @@ class ExperimentPassport(BaseModel):
     cluster_level: Optional[ClusterLevel] = Field(
         None, description="Уровень кластеризации SE; для ресторанного домена по умолчанию — restaurant"
     )
-    inference: InferenceMethod = Field(InferenceMethod.ASYMPTOTIC, description="Метод инференса")
+    inference: Optional[InferenceMethod] = Field(
+        None,
+        description=(
+            "Метод инференса; по умолчанию для ресторанного домена — randomization (точен по построению; "
+            "асимптотический CR2 на истории с тяжёлыми хвостами при 50 на руку давал FPR 6–7,7%, фаза 1), "
+            "для гостевого — asymptotic"
+        ),
+    )
     n_clusters: Optional[int] = Field(
         None, gt=0, description="Число кластеров в пуле (ресторанов); для ресторанного домена по умолчанию — daily_eligible_units"
     )
@@ -321,6 +328,8 @@ class ExperimentPassport(BaseModel):
         clustered = domain in (Domain.RESTAURANT, Domain.RESTAURANT_TIME)
         if data.get("estimand") is None:
             data["estimand"] = Estimand.PER_RESTAURANT_MEAN if clustered else Estimand.ITT
+        if data.get("inference") is None:
+            data["inference"] = InferenceMethod.RANDOMIZATION if clustered else InferenceMethod.ASYMPTOTIC
         if data.get("cluster_level") is None:
             data["cluster_level"] = ClusterLevel.RESTAURANT if clustered else ClusterLevel.NONE
         if data.get("generalization_population") is None:

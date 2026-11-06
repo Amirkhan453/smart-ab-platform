@@ -41,6 +41,8 @@ def test_restaurant_defaults_are_clustered():
     assert p.domain == Domain.RESTAURANT
     assert p.estimand == Estimand.PER_RESTAURANT_MEAN
     assert p.cluster_level == ClusterLevel.RESTAURANT
+    assert p.inference == InferenceMethod.RANDOMIZATION
+    assert ExperimentPassport(**base()).inference == InferenceMethod.ASYMPTOTIC
 
 
 # ---------------- валидаторы раздела 9 ----------------
@@ -58,7 +60,8 @@ def test_restaurant_requires_cuped():
 
 def test_few_clusters_require_randomization_or_wild_bootstrap():
     with pytest.raises(ValueError, match="асимптотический"):
-        ExperimentPassport(**restaurant(n_clusters=60))
+        ExperimentPassport(**restaurant(n_clusters=60, inference=InferenceMethod.ASYMPTOTIC))
+    assert ExperimentPassport(**restaurant(n_clusters=60)).inference == InferenceMethod.RANDOMIZATION
     for inf in (InferenceMethod.RANDOMIZATION, InferenceMethod.WILD_BOOTSTRAP):
         assert ExperimentPassport(**restaurant(n_clusters=60, inference=inf)).inference == inf
 

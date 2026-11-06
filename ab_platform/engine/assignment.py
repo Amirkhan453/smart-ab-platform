@@ -37,6 +37,16 @@ class DeterministicAssignmentEngine:
         return int((hash_64 * 10000) // (0xFFFFFFFFFFFFFFFF + 1))
 
     @classmethod
+    def buckets_for(cls, salt_key: str, unit_ids) -> np.ndarray:
+        """Бакеты [0, 10000) для набора единиц тем же хэшем, что и assign_user (для A/A на боевом пути)."""
+        return np.fromiter((cls._hash_to_10000_buckets(salt_key, str(u)) for u in unit_ids), dtype=np.int64)
+
+    @staticmethod
+    def control_from_bucket(z, control_split_pct: float):
+        """Правило сплита A/B, общее для assign_user и A/A: control, если (z mod 100) < control_split_pct."""
+        return (np.asarray(z) % 100) < control_split_pct
+
+    @classmethod
     def assign_user(
         cls,
         user_id: str,
@@ -115,7 +125,7 @@ class DeterministicAssignmentEngine:
                     chosen_variant = v.variant_id
                     break
         else:
-            chosen_variant = "control" if r_bucket < control_split_pct else "treatment"
+            chosen_variant = "control" if bool(cls.control_from_bucket(z, control_split_pct)) else "treatment"
 
         return AssignmentResult(
             user_id=user_id,

@@ -288,7 +288,11 @@ def test_orchestrator_restaurant_effect_is_ship_candidate(rnet):
     net2, truth = inject(rnet, treated, start, start + pd.Timedelta(days=27), lift=0.05, lift_on="avg_check")
     r = O.evaluate_experiment(restaurant_passport(200), store_days(net2, treated, start), user_col="restaurant_id")
     assert r.decision_status == DecisionStatus.SHIP_CANDIDATE
-    assert r.primary_metric_result["criterion"] == "lin_cr2_bell_mccaffrey"
+    assert r.primary_metric_result["criterion"].startswith("randomization_test")
+    asym = O.evaluate_experiment(restaurant_passport(200, inference=InferenceMethod.ASYMPTOTIC),
+                                 store_days(net2, treated, start), user_col="restaurant_id")
+    assert asym.primary_metric_result["criterion"] == "lin_cr2_bell_mccaffrey"
+    assert asym.decision_status == DecisionStatus.SHIP_CANDIDATE
     assert r.estimand == "per_restaurant_mean" and r.clean_sample_size == 200
     pr = r.primary_metric_result
     assert pr["ci_lower"] <= truth.per_restaurant_mean_abs <= pr["ci_upper"]
@@ -301,8 +305,8 @@ def test_orchestrator_few_restaurants_uses_randomization(rnet):
     df = store_days(rnet, treated, start)
     df = df[df.restaurant_id.isin(ids)]
     with pytest.raises(ValueError, match="асимптотический"):
-        restaurant_passport(20)
-    p = restaurant_passport(20, inference=InferenceMethod.RANDOMIZATION)
+        restaurant_passport(20, inference=InferenceMethod.ASYMPTOTIC)
+    p = restaurant_passport(20)
     r = O.evaluate_experiment(p, df, user_col="restaurant_id")
     assert r.primary_metric_result["criterion"].startswith("randomization_test")
     assert r.decision_status != DecisionStatus.SHIP_CANDIDATE
