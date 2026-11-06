@@ -1,0 +1,107 @@
+{
+  "description": "Эталонные значения MurmurHash3 x86_32, seed 0, ключ в UTF-8; bucket = hash mod 10000. Общие для всех SDK.",
+  "source": "Посчитаны независимой C-реализацией tests/vectors/mm_reference.c (stdin: ключ на строку).",
+  "smhasher_verification": "B0F57EE3",
+  "vectors": [
+    {
+      "key": "a",
+      "uint32": 1009084850,
+      "bucket": 4850
+    },
+    {
+      "key": "ab",
+      "uint32": 2613040991,
+      "bucket": 991
+    },
+    {
+      "key": "abc",
+      "uint32": 3017643002,
+      "bucket": 3002
+    },
+    {
+      "key": "abcd",
+      "uint32": 1139631978,
+      "bucket": 1978
+    },
+    {
+      "key": "abcde",
+      "uint32": 3902511862,
+      "bucket": 1862
+    },
+    {
+      "key": "test",
+      "uint32": 3127628307,
+      "bucket": 8307
+    },
+    {
+      "key": "Hello, world!",
+      "uint32": 3224780355,
+      "bucket": 355
+    },
+    {
+      "key": "salt:unit123",
+      "uint32": 2209825291,
+      "bucket": 5291
+    },
+    {
+      "key": "1:23",
+      "uint32": 2951510740,
+      "bucket": 740
+    },
+    {
+      "key": "12:3",
+      "uint32": 2213266828,
+      "bucket": 6828
+    },
+    {
+      "key": "layer:main:guest_1",
+      "uint32": 919696589,
+      "bucket": 6589
+    },
+    {
+      "key": "exp_checkout_2026:user_000777",
+      "uint32": 2643292185,
+      "bucket": 2185
+    },
+    {
+      "key": "global_holdout_v1:guest_42",
+      "uint32": 1098881757,
+      "bucket": 1757
+    },
+    {
+      "key": "holdout:Гость-007",
+      "uint32": 379659204,
+      "bucket": 9204
+    },
+    {
+      "key": "Вкусно — и точка",
+      "uint32": 999361091,
+      "bucket": 1091
+    },
+    {
+      "key": "🍔:бургер",
+      "uint32": 2816222384,
+      "bucket": 2384
+    },
+    {
+      "key": "é",
+      "uint32": 269551495,
+      "bucket": 1495
+    },
+    {
+      "key": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "uint32": 3288984187,
+      "bucket": 4187
+    },
+    {
+      "key": "aa:1:0:u0",
+      "uint32": 2826170757,
+      "bucket": 757
+    },
+    {
+      "key": "aa:1:0:u499",
+      "uint32": 1393543384,
+      "bucket": 3384
+    }
+  ]
+}
