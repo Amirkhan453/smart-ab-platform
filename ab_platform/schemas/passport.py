@@ -5,6 +5,8 @@ from enum import Enum
 from typing import Any, Dict, List, Literal, Optional
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from ab_platform.schemas.targeting import Targeting
+
 
 class ExperimentType(str, Enum):
     CLASSIC_AB = "classic_ab"
@@ -128,6 +130,7 @@ _DOMAIN_BY_UNIT = {
 MIN_CLUSTERS_PER_ARM_ASYMPTOTIC = 50
 MIN_PAIRS = 6
 FORBIDDEN_LEVERS_MVP = frozenset({"price", "цена"})
+MAX_VARIANT_PARAMS_BYTES = 8192
 
 
 class PassportStatus(str, Enum):
@@ -194,6 +197,20 @@ class VariantAllocation(BaseModel):
     variant_id: str = Field(..., min_length=1, description="Например: 'control', 'treatment_1'")
     traffic_percentage: float = Field(..., gt=0.0, le=100.0)
     is_control: bool = False
+    params: Dict[str, Any] = Field(
+        default_factory=dict, description="Параметры варианта для приложения (ТЗ v4.1, PRM-1); входят в хэш Паспорта"
+    )
+
+    @field_validator("params")
+    @classmethod
+    def _params_are_json(cls, v: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            text = json.dumps(v, ensure_ascii=False, allow_nan=False, sort_keys=True)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"params должны быть JSON без NaN и бесконечностей: {exc}") from exc
+        if len(text.encode("utf-8")) > MAX_VARIANT_PARAMS_BYTES:
+            raise ValueError(f"params больше {MAX_VARIANT_PARAMS_BYTES} байт: это настройки, а не контент.")
+        return json.loads(text)  # копия из простых типов JSON: кортежи → списки, порядок ключей не важен
 
 
 class RiskProfile(BaseModel):
@@ -226,6 +243,10 @@ class ExperimentPassport(BaseModel):
     passport_hash: Optional[str] = Field(
         None, description="SHA-256 хэш канонической версии Паспорта; вычисляется методом compute_hash()"
     )
+    owner: Optional[str] = Field(None, min_length=1, description="Владелец гипотезы (ТЗ v4, 2.1)")
+    approved_by: Optional[str] = Field(
+        None, min_length=1, description="Кто утвердил; проставляется при переходе в Approved и не может совпадать с владельцем"
+    )
     test_key: str = Field(..., min_length=1, description="Уникальный ключ фичи для ортогонального хэширования")
     layer_id: str = Field("default_layer", min_length=1, description="Слой (Plane) для изоляции экспериментов")
     layer_slot_start: int = Field(0, ge=0, lt=10000, description="Начальный бакет-слот в слое [0..10000)")
@@ -240,6 +261,19 @@ class ExperimentPassport(BaseModel):
     randomization_unit: RandomizationUnit = RandomizationUnit.USER_ID
     analysis_unit: AnalysisUnit = AnalysisUnit.USER
     variants: List[VariantAllocation]
+
+    # ---- Приложение (ТЗ v4.1: TGT-1, TGT-5, IDN-1, LNK-2) ----
+    targeting: Targeting = Field(default_factory=Targeting, description="Условия применимости; часть хэша Паспорта")
+    targeting_audience_share: Optional[float] = Field(
+        None, gt=0.0, le=1.0,
+        description="Доля daily_eligible_units, подходящая под таргетинг; обязательна, если условия заданы",
+    )
+    exposure_surface: Literal["post_login", "pre_login"] = Field(
+        "post_login", description="Где гость видит изменение: после входа в приложение или до него"
+    )
+    ramp_plan: List[float] = Field(
+        default_factory=lambda: [100.0], description="План раскатки, % дорожки по возрастанию; старт — с первого шага"
+    )
 
     # ---- Дизайн v4 (ТЗ v4, раздел 9) ----
     domain: Optional[Domain] = Field(None, description="Домен рандомизации; по умолчанию — из randomization_unit")
@@ -401,7 +435,31 @@ class ExperimentPassport(BaseModel):
             )
 
         self._validate_v4_design()
+        self._validate_app_design()
         return self
+
+    def _validate_app_design(self) -> None:
+        """Валидаторы ТЗ v4.1: IDN-1, TGT-1, TGT-5, план раскатки, «второй человек»."""
+        guest_unit = self.randomization_unit in (RandomizationUnit.USER_ID, RandomizationUnit.DEVICE_ID)
+        if self.exposure_surface == "pre_login" and self.randomization_unit != RandomizationUnit.DEVICE_ID:
+            raise ValueError(
+                "Экран до входа: гость ещё не известен, единица рандомизации должна быть device_id (ТЗ v4.1, IDN-1)."
+            )
+        if not self.targeting.is_empty:
+            if not guest_unit:
+                raise ValueError("Таргетинг по признакам приложения допустим только для единиц user_id и device_id.")
+            if self.targeting_audience_share is None:
+                raise ValueError(
+                    "Заданы условия таргетинга: укажите targeting_audience_share — долю трафика, которая под них "
+                    "подходит. Иначе мощность посчитается по всей базе (ТЗ v4.1, TGT-5)."
+                )
+        elif self.targeting_audience_share is not None:
+            raise ValueError("targeting_audience_share задаётся только вместе с условиями таргетинга.")
+        plan = self.ramp_plan
+        if not plan or any(not (0.0 < x <= 100.0) for x in plan) or any(a >= b for a, b in zip(plan, plan[1:])):
+            raise ValueError(f"ramp_plan должен строго возрастать в пределах (0; 100], получено: {plan}.")
+        if self.owner is not None and self.owner == self.approved_by:
+            raise ValueError("Паспорт не может утвердить его владелец: нужен второй человек (ТЗ v4, 2.2).")
 
     def _validate_v4_design(self) -> None:
         """Валидаторы ТЗ v4, раздел 9 (1–7, 9; 8 и 10 — в фазах 4 и 8)."""
@@ -477,6 +535,23 @@ class ExperimentPassport(BaseModel):
     def auto_ship_allowed(self) -> bool:
         return self.evidence_level in AUTO_SHIP_EVIDENCE
 
+    @property
+    def target_daily_units(self) -> int:
+        """Трафик единиц в день с учётом таргетинга — вход калькулятора мощности (ТЗ v4.1, TGT-5)."""
+        return int(self.daily_eligible_units * (self.targeting_audience_share or 1.0))
+
+    @property
+    def design_warnings(self) -> List[str]:
+        """Оговорки дизайна, которые не блокируют Паспорт, но обязаны попасть в форму и отчёт (TGT-3, IDN-1)."""
+        out = [f"Таргетинг по признаку, на который может влиять тест, — {w}. Анализ только по первому показу."
+               for w in self.targeting.treatment_sensitive]
+        if self.randomization_unit == RandomizationUnit.DEVICE_ID:
+            out.append(
+                "Единица — устройство, а не гость: один гость на двух устройствах может увидеть оба варианта, "
+                "эффект относится к устройствам и не склеивается с заказами после входа (ТЗ v4.1, IDN-1)."
+            )
+        return out
+
     # ---------------- неизменяемость и версии ----------------
     def model_copy(self, *, update: Optional[Dict[str, Any]] = None, deep: bool = False) -> "ExperimentPassport":
         """Копия с изменениями, которая заново проходит все валидаторы (обход через update запрещён)."""
@@ -498,13 +573,19 @@ class ExperimentPassport(BaseModel):
         canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
-    def with_status(self, new_status: PassportStatus | str) -> "ExperimentPassport":
-        """Переход статуса только по допустимым переходам ТЗ v4, 2.2."""
+    def with_status(self, new_status: PassportStatus | str, actor: Optional[str] = None) -> "ExperimentPassport":
+        """
+        Переход статуса только по допустимым переходам ТЗ v4, 2.2.
+        actor при утверждении записывается в approved_by; совпадение с владельцем отклоняется.
+        """
         new_status = PassportStatus(new_status)
         if new_status not in ALLOWED_TRANSITIONS[self.status]:
             raise ValueError(f"Недопустимый переход статуса: {self.status.value} → {new_status.value}.")
         if new_status == PassportStatus.APPROVED:
-            sealed = self.model_copy(update={"status": new_status})
+            update: Dict[str, Any] = {"status": new_status}
+            if actor is not None:
+                update["approved_by"] = actor
+            sealed = self.model_copy(update=update)
             return sealed.model_copy(update={"passport_hash": sealed.compute_hash()})
         if self.passport_hash is not None and self.passport_hash != self.compute_hash():
             raise ValueError("Хэш Паспорта не совпадает с содержимым: Паспорт изменён после утверждения.")
@@ -519,10 +600,10 @@ class ExperimentPassport(BaseModel):
         """Новая версия Паспорта с изменениями: version + 1, статус draft, хэш сброшен."""
         if not changes:
             raise ValueError("new_version без изменений не имеет смысла.")
-        protected = {"version", "passport_hash", "status", "created_at", "experiment_id"}
+        protected = {"version", "passport_hash", "status", "created_at", "experiment_id", "approved_by"}
         if protected & set(changes):
             raise ValueError(f"Поля {sorted(protected & set(changes))} нельзя менять через new_version.")
         return self.model_copy(update={
             **changes, "version": self.version + 1, "status": PassportStatus.DRAFT,
-            "passport_hash": None, "created_at": datetime.now(timezone.utc),
+            "passport_hash": None, "approved_by": None, "created_at": datetime.now(timezone.utc),
         })

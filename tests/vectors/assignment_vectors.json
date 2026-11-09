@@ -287,12 +287,14 @@
       {
        "variant_id": "control",
        "traffic_percentage": 50.0,
-       "is_control": true
+       "is_control": true,
+       "params": {}
       },
       {
        "variant_id": "treatment",
        "traffic_percentage": 50.0,
-       "is_control": false
+       "is_control": false,
+       "params": {}
       }
      ],
      "kill_switch": false
@@ -309,17 +311,20 @@
       {
        "variant_id": "A",
        "traffic_percentage": 33.33,
-       "is_control": false
+       "is_control": false,
+       "params": {}
       },
       {
        "variant_id": "B",
        "traffic_percentage": 33.33,
-       "is_control": true
+       "is_control": true,
+       "params": {}
       },
       {
        "variant_id": "C",
        "traffic_percentage": 33.34,
-       "is_control": false
+       "is_control": false,
+       "params": {}
       }
      ],
      "kill_switch": false
@@ -336,17 +341,20 @@
       {
        "variant_id": "v1",
        "traffic_percentage": 10.0,
-       "is_control": false
+       "is_control": false,
+       "params": {}
       },
       {
        "variant_id": "v2",
        "traffic_percentage": 20.0,
-       "is_control": true
+       "is_control": true,
+       "params": {}
       },
       {
        "variant_id": "v3",
        "traffic_percentage": 70.0,
-       "is_control": false
+       "is_control": false,
+       "params": {}
       }
      ],
      "kill_switch": false
@@ -363,12 +371,14 @@
       {
        "variant_id": "off",
        "traffic_percentage": 50.0,
-       "is_control": true
+       "is_control": true,
+       "params": {}
       },
       {
        "variant_id": "on",
        "traffic_percentage": 50.0,
-       "is_control": false
+       "is_control": false,
+       "params": {}
       }
      ],
      "kill_switch": true
@@ -385,23 +395,26 @@
       {
        "variant_id": "c",
        "traffic_percentage": 33.333333333333336,
-       "is_control": true
+       "is_control": true,
+       "params": {}
       },
       {
        "variant_id": "t1",
        "traffic_percentage": 33.333333333333336,
-       "is_control": false
+       "is_control": false,
+       "params": {}
       },
       {
        "variant_id": "t2",
        "traffic_percentage": 33.333333333333336,
-       "is_control": false
+       "is_control": false,
+       "params": {}
       }
      ],
      "kill_switch": false
     }
    ],
-   "etag": "e4db6d35521d82d3165f50ea8b6e457e"
+   "etag": "e2c4bc5b07fef209d3f6623f32701b73"
   },
   {
    "version": 1,
@@ -430,12 +443,14 @@
       {
        "variant_id": "off",
        "traffic_percentage": 50.0,
-       "is_control": true
+       "is_control": true,
+       "params": {}
       },
       {
        "variant_id": "on",
        "traffic_percentage": 50.0,
-       "is_control": false
+       "is_control": false,
+       "params": {}
       }
      ],
      "kill_switch": false
@@ -452,18 +467,20 @@
       {
        "variant_id": "x",
        "traffic_percentage": 0.005,
-       "is_control": false
+       "is_control": false,
+       "params": {}
       },
       {
        "variant_id": "y",
        "traffic_percentage": 99.995,
-       "is_control": true
+       "is_control": true,
+       "params": {}
       }
      ],
      "kill_switch": false
     }
    ],
-   "etag": "a60403441738d32e508ef0518ab3d727"
+   "etag": "72f234a007aeaef853ecaac2d36d6dd7"
   }
  ],
  "cases": [
