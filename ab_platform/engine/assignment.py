@@ -7,6 +7,7 @@
 Двухшаговая схема:
   0) holdout:  bucket(holdout_salt, id) < доля holdout → гость вне всех тестов;
   1) слой:     b_L = bucket(layer_salt, id); дорожка эксперимента — диапазон [s, e) бакетов слоя;
+               таргетинг (ТЗ v4.1): гость дорожки, не прошедший условия, получает контроль с причиной;
                ramp-up — активный поддиапазон [s, s + ramp·(e − s)), он только растёт (sticky);
   2) вариант:  b_V = bucket(experiment_salt, id), варианты нарезаются по 10 000 бакетам.
 
@@ -167,10 +168,15 @@ class DeterministicAssignmentEngine:
         layer_slot_end: int = N_BUCKETS,
         variants: Optional[Sequence[VariantAllocation]] = None,
         layer_salt: Optional[str] = None,
+        ineligible_reason: Optional[str] = None,
+        holdout_bucket: Optional[int] = None,
+        layer_bucket: Optional[int] = None,
     ) -> AssignmentResult:
         """
         exposure_rate_pct — ramp-up внутри дорожки [layer_slot_start, layer_slot_end);
         соль эксперимента — shared_hash_id или experiment_id; соль слоя — layer_salt или "layer:{layer_id}".
+        ineligible_reason — причина, по которой гость не подходит под таргетинг (проверяется после дорожки);
+        holdout_bucket и layer_bucket — уже посчитанные бакеты гостя, чтобы не хэшировать повторно.
         """
         if not (0.0 <= exposure_rate_pct <= 100.0):
             raise ValueError(f"exposure_rate_pct должен быть в [0, 100], получено: {exposure_rate_pct}")
@@ -196,14 +202,16 @@ class DeterministicAssignmentEngine:
 
         # Шаг 0: глобальный holdout
         if global_holdout_pct > 0.0:
-            z_holdout = bucket(holdout_salt, user_id)
+            z_holdout = bucket(holdout_salt, user_id) if holdout_bucket is None else holdout_bucket
             if z_holdout < pct_to_buckets(global_holdout_pct):
                 return outside(REASON_HOLDOUT, z_holdout, in_holdout=True)
 
         # Шаг 1: слой → дорожка → ramp
-        z_layer = bucket(layer_salt or f"layer:{layer_id}", user_id)
+        z_layer = bucket(layer_salt or f"layer:{layer_id}", user_id) if layer_bucket is None else layer_bucket
         if not (layer_slot_start <= z_layer < layer_slot_end):
             return outside(REASON_NOT_IN_LANE, z_layer)
+        if ineligible_reason is not None:
+            return outside(ineligible_reason, z_layer)
         _, ramp_end = ramp_range(layer_slot_start, layer_slot_end, exposure_rate_pct)
         if z_layer >= ramp_end:
             return outside(REASON_RAMP, z_layer)

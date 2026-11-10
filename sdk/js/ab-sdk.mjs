@@ -9,6 +9,10 @@
  * - Решение считается локально; ruleset обновляется по ETag не реже раза в 30 с.
  * - Fail-open: при любой ошибке — контрольный вариант с причиной fallback:*.
  * - Exposure — только для гостя в тесте, один раз на (гость, эксперимент, сессию), пачками.
+ * - Таргетинг (ТЗ v4.1): условия проверяются после дорожки и до ramp-up, одинаково для всех вариантов.
+ *   Правила сравнения — как в ab_platform/schemas/targeting.py: версии по числам, регистр только A–Z,
+ *   булевы признаки строго true/false. После первого показа гость остаётся в тесте (в пределах клиента).
+ * - Решение и показ можно разделить: getVariant(..., { logExposure: false }), затем logExposure(decision).
  */
 
 export const N_BUCKETS = 10000;
@@ -19,6 +23,8 @@ export const REASON_HOLDOUT = "holdout";
 export const REASON_NOT_IN_LANE = "not_in_lane";
 export const REASON_RAMP = "ramp";
 export const REASON_KILL_SWITCH = "kill_switch";
+export const REASON_UNIT_TYPE = "unit_type_mismatch";
+export const TARGETING_ATTRIBUTES = ["platform", "app_version", "city", "region", "is_new_guest", "has_delivery"];
 export const FALLBACK_NO_RULESET = "fallback:no_ruleset";
 export const FALLBACK_STALE = "fallback:stale_ruleset";
 export const FALLBACK_UNKNOWN_FLAG = "fallback:unknown_flag";
@@ -124,6 +130,95 @@ export function allocateVariantBuckets(percentages) {
   return counts;
 }
 
+// --- таргетинг ----------------------------------------------------------------------------------
+
+/** Нижний регистр только для A–Z: toLowerCase() зависит от Юникода и расходится между языками. */
+export function asciiLower(text) {
+  return text.replace(/[A-Z]/g, (c) => String.fromCharCode(c.charCodeAt(0) + 32));
+}
+
+const VERSION_RE = /^[0-9]{1,9}(\.[0-9]{1,9}){0,5}$/;
+
+/** Версия → массив чисел без хвостовых нулей; null, если это не версия. */
+export function parseVersion(text) {
+  if (typeof text !== "string" || !VERSION_RE.test(text)) return null;
+  const parts = text.split(".").map((p) => Number.parseInt(p, 10));
+  while (parts.length > 1 && parts[parts.length - 1] === 0) parts.pop();
+  return parts;
+}
+
+/** Сравнение версий: −1, 0, 1. Короткая версия, совпадающая с началом длинной, меньше. */
+export function compareVersions(a, b) {
+  for (let i = 0; i < Math.min(a.length, b.length); i++) {
+    if (a[i] !== b[i]) return a[i] < b[i] ? -1 : 1;
+  }
+  return a.length === b.length ? 0 : a.length < b.length ? -1 : 1;
+}
+
+function compileTargeting(t, experimentId) {
+  t = t ?? {};
+  const list = (v) => (v == null ? null : new Set(v));
+  const version = (v, name) => {
+    if (v == null) return null;
+    const parsed = parseVersion(v);
+    if (!parsed) throw new Error(`ruleset: у '${experimentId}' ${name} — не версия`);
+    return parsed;
+  };
+  const c = {
+    platform: list(t.platforms),
+    city: list(t.cities),
+    region: list(t.regions),
+    versionMin: version(t.app_version_min, "app_version_min"),
+    versionMax: version(t.app_version_max, "app_version_max"),
+    is_new_guest: t.is_new_guest ?? null,
+    has_delivery: t.has_delivery ?? null,
+  };
+  const used = {
+    platform: c.platform !== null,
+    app_version: c.versionMin !== null || c.versionMax !== null,
+    city: c.city !== null,
+    region: c.region !== null,
+    is_new_guest: c.is_new_guest !== null,
+    has_delivery: c.has_delivery !== null,
+  };
+  c.required = TARGETING_ATTRIBUTES.filter((a) => used[a]);
+  return c;
+}
+
+/** null — гость подходит; иначе причина по первому невыполненному условию (порядок TARGETING_ATTRIBUTES). */
+export function targetingMismatch(compiled, attributes) {
+  const attrs = attributes ?? {};
+  for (const name of compiled.required) {
+    const value = Object.prototype.hasOwnProperty.call(attrs, name) ? attrs[name] : undefined;
+    if (name === "platform" || name === "city" || name === "region") {
+      if (typeof value !== "string") return `targeting_missing:${name}`;
+      if (!compiled[name].has(asciiLower(value))) return `targeting:${name}`;
+    } else if (name === "app_version") {
+      const v = parseVersion(value);
+      if (!v) return `targeting_missing:${name}`;
+      if ((compiled.versionMin && compareVersions(v, compiled.versionMin) < 0) ||
+          (compiled.versionMax && compareVersions(v, compiled.versionMax) > 0)) {
+        return `targeting:${name}`;
+      }
+    } else {
+      if (typeof value !== "boolean") return `targeting_missing:${name}`;
+      if (value !== compiled[name]) return `targeting:${name}`;
+    }
+  }
+  return null;
+}
+
+/** Снимок признаков для показа: только признаки таргетинга и только строки и булевы. */
+export function knownAttributes(attributes) {
+  if (!attributes) return null;
+  const out = {};
+  for (const name of TARGETING_ATTRIBUTES) {
+    const v = Object.prototype.hasOwnProperty.call(attributes, name) ? attributes[name] : undefined;
+    if (typeof v === "string" || typeof v === "boolean") out[name] = v;
+  }
+  return Object.keys(out).length ? out : null;
+}
+
 // --- ruleset ------------------------------------------------------------------------------------
 
 /**
@@ -149,23 +244,35 @@ export function parseRuleset(json) {
     if (flags.has(e.flag_key)) throw new Error(`ruleset: flag_key '${e.flag_key}' повторяется`);
     const control = e.variants.find((v) => v.is_control).variant_id;
     const alloc = allocateVariantBuckets(e.variants.map((v) => v.traffic_percentage));
-    flags.set(e.flag_key, { rule: e, control, alloc });
+    const params = new Map(e.variants.map((v) => [v.variant_id, v.params ?? {}]));
+    flags.set(e.flag_key, { rule: e, control, alloc, params, targeting: compileTargeting(e.targeting, e.experiment_id),
+      unitType: e.unit_type ?? "guest_id" });
   }
   return { version: rs.version, etag: rs.etag ?? null, holdout: rs.holdout, raw: rs, layers, flags };
 }
 
-/** Вариант гостя по правилу (одна точка вычисления, как evaluate в Python). */
-export function evaluate(ruleset, flagKey, unitId) {
+/**
+ * Вариант гостя по правилу (одна точка вычисления, как evaluate в Python).
+ * Порядок: kill-switch → тип единицы → holdout → слой и дорожка → таргетинг → ramp-up → вариант.
+ * unitType — тип переданного идентификатора (null — не сверять); enrolled — первый показ уже был.
+ */
+export function evaluate(ruleset, flagKey, unitId, { attributes = null, unitType = null, enrolled = false } = {}) {
   const entry = ruleset.flags.get(flagKey);
   if (!entry) throw new Error(`неизвестный флаг '${flagKey}'`);
-  const { rule, control, alloc } = entry;
-  const out = (reason) => ({ variantId: control, inExperiment: false, reason, experimentId: rule.experiment_id });
+  const { rule, control, alloc, params } = entry;
+  const out = (reason) => ({ variantId: control, inExperiment: false, reason, experimentId: rule.experiment_id,
+    params: params.get(control) });
   if (rule.kill_switch) return out(REASON_KILL_SWITCH);
+  if (unitType != null && unitType !== entry.unitType) return out(REASON_UNIT_TYPE);
   const layer = ruleset.layers.get(rule.layer_id);
   const holdoutPct = layer.marketing ? ruleset.holdout.pct : 0;
   if (holdoutPct > 0 && bucket(ruleset.holdout.salt, unitId) < pctToBuckets(holdoutPct)) return out(REASON_HOLDOUT);
   const zl = bucket(layer.salt, unitId);
   if (!(rule.slot_start <= zl && zl < rule.slot_end)) return out(REASON_NOT_IN_LANE);
+  if (!enrolled) {
+    const mismatch = targetingMismatch(entry.targeting, attributes);
+    if (mismatch) return out(mismatch);
+  }
   if (zl >= rampEnd(rule.slot_start, rule.slot_end, rule.ramp_pct)) return out(REASON_RAMP);
   const z = bucket(rule.salt, unitId);
   let cum = 0;
@@ -177,7 +284,8 @@ export function evaluate(ruleset, flagKey, unitId) {
       break;
     }
   }
-  return { variantId: chosen, inExperiment: true, reason: REASON_ASSIGNED, experimentId: rule.experiment_id };
+  return { variantId: chosen, inExperiment: true, reason: REASON_ASSIGNED, experimentId: rule.experiment_id,
+    params: params.get(chosen) };
 }
 
 // --- HTTP-транспорт -----------------------------------------------------------------------------
@@ -253,6 +361,7 @@ export class ExperimentClient {
     this._fetchedAt = this._ruleset ? clock() : null;
     this._buffer = [];
     this._seen = new Map();
+    this._enrolled = new Map(); // "гость, эксперимент" с первым показом
     this._timer = null;
     this._tick = null;
     this.decisions = {};
@@ -327,11 +436,15 @@ export class ExperimentClient {
       reason,
       experimentId: entry ? entry.rule.experiment_id : null,
       rulesetVersion: this._ruleset ? this._ruleset.version : null,
+      params: entry ? entry.params.get(entry.control) : {},
+      unitType: entry ? entry.unitType : null,
+      attributes: null,
     };
   }
 
   /** Вариант гостя. Никогда не бросает. defaultVariant — если ruleset или флаг неизвестны. */
-  getVariant(flagKey, unitId, { sessionId = null, defaultVariant = "control" } = {}) {
+  getVariant(flagKey, unitId, { sessionId = null, defaultVariant = "control", attributes = null, unitType = null,
+    logExposure = true } = {}) {
     try {
       const rs = this._ruleset;
       if (typeof unitId !== "string" || unitId.length === 0) {
@@ -346,18 +459,31 @@ export class ExperimentClient {
       }
       let res;
       try {
-        res = evaluate(rs, flagKey, unitId);
+        const enrolled = this._enrolled.has(JSON.stringify([unitId, entry.rule.experiment_id]));
+        res = evaluate(rs, flagKey, unitId, { attributes, unitType, enrolled });
       } catch (err) {
         return this._fallback(flagKey, unitId, `fallback:exception:${err?.name ?? "Error"}`, defaultVariant, entry);
       }
       this._count(res.reason);
-      if (res.inExperiment) this._logExposure(unitId, res.experimentId, res.variantId, rs.version, sessionId);
-      return { flagKey, unitId, ...res, rulesetVersion: rs.version };
+      const decision = { flagKey, unitId, ...res, rulesetVersion: rs.version, unitType: entry.unitType,
+        attributes: knownAttributes(attributes) };
+      if (logExposure) this.logExposure(decision, sessionId);
+      return decision;
     } catch (err) {
       // последняя линия fail-open: даже сбой учёта не должен уронить приложение
       return { flagKey, unitId: String(unitId), variantId: defaultVariant, inExperiment: false,
-        reason: `fallback:exception:${err?.name ?? "Error"}`, experimentId: null, rulesetVersion: null };
+        reason: `fallback:exception:${err?.name ?? "Error"}`, experimentId: null, rulesetVersion: null, params: {},
+        unitType: null, attributes: null };
     }
+  }
+
+  /** Показ по решению: только для гостя в тесте. false — показ не нужен или уже учтён. */
+  logExposure(decision, sessionId = null) {
+    if (!decision || !decision.inExperiment || decision.experimentId == null || decision.rulesetVersion == null) {
+      return false;
+    }
+    return this._logExposure(decision.unitId, decision.experimentId, decision.variantId, decision.rulesetVersion,
+      sessionId, decision.unitType ?? null, decision.attributes ?? null);
   }
 
   _count(reason) {
@@ -387,12 +513,16 @@ export class ExperimentClient {
     };
   }
 
-  _logExposure(unitId, experimentId, variantId, version, sessionId) {
+  _logExposure(unitId, experimentId, variantId, version, sessionId, unitType = null, attributes = null) {
+    const enrolledKey = JSON.stringify([unitId, experimentId]);
+    this._enrolled.delete(enrolledKey);
+    this._enrolled.set(enrolledKey, true);
+    if (this._enrolled.size > this._dedupCapacity) this._enrolled.delete(this._enrolled.keys().next().value);
     const key = JSON.stringify([unitId, experimentId, sessionId]);
     if (this._seen.has(key)) {
       this._seen.delete(key);
       this._seen.set(key, true); // в конец очереди вытеснения
-      return;
+      return false;
     }
     this._seen.set(key, true);
     if (this._seen.size > this._dedupCapacity) this._seen.delete(this._seen.keys().next().value);
@@ -408,9 +538,12 @@ export class ExperimentClient {
       variant_id: variantId,
       ruleset_version: version,
       session_id: sessionId,
+      unit_type: unitType,
+      attributes,
     });
     // отправка на границе пачки: после сбоя приёма не долбим его на каждом событии
     if (this._buffer.length % this._batchSize === 0) void this.flush();
+    return true;
   }
 
   /** Отправить буфер. При ошибке события возвращаются в буфер (повтор идемпотентен по event_id). */

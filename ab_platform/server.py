@@ -12,13 +12,14 @@
 import json
 import os
 import threading
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, ValidationError
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, StrictBool, StrictStr, ValidationError, field_validator
 
 from ab_platform.schemas.ruleset import Ruleset
+from ab_platform.schemas.targeting import ATTRIBUTES
 
 MAX_BATCH = 10_000
 
@@ -55,6 +56,17 @@ class ExposureIn(BaseModel):
     variant_id: str = Field(..., min_length=1)
     ruleset_version: int = Field(..., ge=1)
     session_id: Optional[str] = None
+    unit_type: Optional[Literal["guest_id", "device_id"]] = None
+    attributes: Optional[Dict[str, Union[StrictBool, StrictStr]]] = Field(
+        None, description="Снимок признаков таргетинга на момент показа — для SRM по сегментам (TGT-5)"
+    )
+
+    @field_validator("attributes")
+    @classmethod
+    def _only_targeting_attributes(cls, v):
+        if v is not None and (set(v) - set(ATTRIBUTES) or any(isinstance(x, str) and len(x) > 64 for x in v.values())):
+            raise ValueError(f"допустимы только признаки {list(ATTRIBUTES)} длиной до 64 знаков")
+        return v
 
 
 class ExposureStore:

@@ -7,17 +7,22 @@
   с причиной; доля таких ответов видна в метриках (fallback_rate).
 - Exposure создаётся только для гостя в тесте, один раз на (юнит, эксперимент, сессию) в процессе,
   копится в буфере и уходит пачками в sink.
+- Таргетинг (ТЗ v4.1): признаки гостя передаются в get_variant; показ несёт их снимок. После первого показа
+  гость остаётся в тесте в пределах процесса, даже если признак изменился (TGT-3).
+- Решение и показ можно разделить (DEC-2): get_variant(..., log_exposure=False), затем log_exposure(decision)
+  в момент, когда гость реально увидел изменение.
 """
 import threading
 import time
 import uuid
 from collections import Counter, OrderedDict
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from typing import Callable, Dict, List, Optional, Protocol, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Protocol, Tuple
 
 from ab_platform.engine.ruleset_engine import evaluate
 from ab_platform.schemas.ruleset import Ruleset
+from ab_platform.schemas.targeting import ATTRIBUTES
 
 FALLBACK_NO_RULESET = "fallback:no_ruleset"
 FALLBACK_STALE = "fallback:stale_ruleset"
@@ -40,6 +45,17 @@ class Decision:
     reason: str
     experiment_id: Optional[str]
     ruleset_version: Optional[int]
+    params: Dict[str, Any] = field(default_factory=dict)
+    unit_type: Optional[str] = None
+    attributes: Optional[Dict[str, Any]] = None
+
+
+def known_attributes(attributes: Optional[Mapping[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Снимок признаков для показа: только признаки таргетинга и только простых типов (без ПДн и мусора)."""
+    if not attributes:
+        return None
+    out = {k: attributes[k] for k in ATTRIBUTES if isinstance(attributes.get(k), (str, bool))}
+    return out or None
 
 
 @dataclass(frozen=True)
@@ -51,6 +67,8 @@ class ExposureEvent:
     variant_id: str
     ruleset_version: int
     session_id: Optional[str] = None
+    unit_type: Optional[str] = None
+    attributes: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -93,6 +111,7 @@ class ExperimentClient:
         self._count_lock = threading.Lock()
         self._buffer: List[ExposureEvent] = []
         self._seen: "OrderedDict[tuple, None]" = OrderedDict()
+        self._enrolled: "OrderedDict[tuple, None]" = OrderedDict()  # (юнит, эксперимент) с первым показом
         self.decisions: Counter = Counter()
         self.counters: Counter = Counter()  # refresh_ok / not_modified / refresh_error / sent / sink_error / dropped
         self.last_refresh_error: Optional[str] = None
@@ -159,14 +178,19 @@ class ExperimentClient:
     def _fallback(self, flag_key, unit_id, reason, default, rule=None, version=None) -> Decision:
         variant = rule.control_variant_id if rule is not None else default
         self._count(reason)
-        return Decision(flag_key, str(unit_id), variant, False, reason,
-                        rule.experiment_id if rule is not None else None, version)
+        if rule is None:
+            return Decision(flag_key, str(unit_id), variant, False, reason, None, version)
+        return Decision(flag_key, str(unit_id), variant, False, reason, rule.experiment_id, version,
+                        rule.params_of(variant), rule.unit_type)
 
     def get_variant(self, flag_key: str, unit_id: str, session_id: Optional[str] = None,
-                    default: str = "control") -> Decision:
+                    default: str = "control", attributes: Optional[Mapping[str, Any]] = None,
+                    unit_type: Optional[str] = None, log_exposure: bool = True) -> Decision:
         """
         Вариант гостя. Никогда не бросает исключений. default — что отдать, если ruleset или флаг неизвестны
         (контрольный вариант известного флага берётся из ruleset).
+        attributes — признаки для таргетинга; unit_type — "guest_id" или "device_id", если его надо сверить
+        с правилом; log_exposure=False — только решение, показ отправляется позже через log_exposure().
         """
         rs = self._ruleset
         if not unit_id or not isinstance(unit_id, str):
@@ -180,15 +204,25 @@ class ExperimentClient:
         if self._fetcher is not None and age is not None and age > self.max_stale_s:
             return self._fallback(flag_key, unit_id, FALLBACK_STALE, default, rule, rs.version)
         try:
-            res = evaluate(rs, rule, unit_id)
+            res = evaluate(rs, rule, unit_id, attributes, unit_type,
+                           enrolled=(unit_id, rule.experiment_id) in self._enrolled)
+            decision = Decision(flag_key, unit_id, res.variant_id, res.is_exposed, res.reason, rule.experiment_id,
+                                rs.version, rule.params_of(res.variant_id), rule.unit_type,
+                                known_attributes(attributes))
         except Exception as exc:
             return self._fallback(flag_key, unit_id, f"fallback:exception:{type(exc).__name__}", default, rule,
                                   rs.version)
         self._count(res.reason)
-        if res.is_exposed:
-            self._log_exposure(unit_id, rule.experiment_id, res.variant_id, rs.version, session_id)
-        return Decision(flag_key, unit_id, res.variant_id, res.is_exposed, res.reason, rule.experiment_id,
-                        rs.version)
+        if log_exposure:
+            self.log_exposure(decision, session_id)
+        return decision
+
+    def log_exposure(self, decision: Decision, session_id: Optional[str] = None) -> bool:
+        """Показ по решению: только для гостя в тесте. Возвращает False, если показ не нужен или уже учтён."""
+        if not decision.in_experiment or decision.experiment_id is None or decision.ruleset_version is None:
+            return False
+        return self._log_exposure(decision.unit_id, decision.experiment_id, decision.variant_id,
+                                  decision.ruleset_version, session_id, decision.unit_type, decision.attributes)
 
     def _count(self, reason: str) -> None:
         with self._count_lock:
@@ -214,12 +248,17 @@ class ExperimentClient:
 
     # --- exposure ----------------------------------------------------------------------------------
 
-    def _log_exposure(self, unit_id, experiment_id, variant_id, version, session_id) -> None:
+    def _log_exposure(self, unit_id, experiment_id, variant_id, version, session_id, unit_type=None,
+                      attributes=None) -> bool:
         key = (unit_id, experiment_id, session_id)
         with self._lock:
+            self._enrolled[(unit_id, experiment_id)] = None
+            self._enrolled.move_to_end((unit_id, experiment_id))
+            if len(self._enrolled) > self._dedup_capacity:
+                self._enrolled.popitem(last=False)
             if key in self._seen:
                 self._seen.move_to_end(key)
-                return
+                return False
             self._seen[key] = None
             if len(self._seen) > self._dedup_capacity:
                 self._seen.popitem(last=False)
@@ -230,12 +269,13 @@ class ExperimentClient:
                 event_id=str(uuid.uuid4()),
                 event_time=datetime.now(timezone.utc).isoformat(),
                 unit_id=unit_id, experiment_id=experiment_id, variant_id=variant_id,
-                ruleset_version=version, session_id=session_id,
+                ruleset_version=version, session_id=session_id, unit_type=unit_type, attributes=attributes,
             ))
             # отправка на границе пачки: после сбоя приёма не долбим его на каждом событии
             full = len(self._buffer) % self._batch_size == 0
         if full:
             self.flush()
+        return True
 
     def flush(self) -> int:
         """Отправить буфер в sink. При ошибке sink события возвращаются в буфер (повтор идемпотентен по event_id)."""

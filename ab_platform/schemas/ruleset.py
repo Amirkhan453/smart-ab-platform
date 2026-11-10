@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, computed_field, 
 
 from ab_platform.engine.assignment import N_BUCKETS
 from ab_platform.schemas.passport import VariantAllocation
+from ab_platform.schemas.targeting import Targeting
 
 
 class HoldoutConfig(BaseModel):
@@ -42,7 +43,10 @@ class Layer(BaseModel):
 
 
 class ExperimentRule(BaseModel):
-    """Правило эксперимента: дорожка [slot_start, slot_end) в слое, ramp-up внутри неё, варианты, kill-switch."""
+    """
+    Правило эксперимента: дорожка [slot_start, slot_end) в слое, таргетинг, ramp-up внутри дорожки, варианты
+    с параметрами, kill-switch. passport_* — из какого утверждённого Паспорта построено правило (ТЗ v4.1, LNK-1).
+    """
     model_config = ConfigDict(frozen=True, extra="forbid")
     experiment_id: str = Field(..., min_length=1)
     flag_key: Optional[str] = None
@@ -53,6 +57,11 @@ class ExperimentRule(BaseModel):
     salt: Optional[str] = None
     variants: List[VariantAllocation]
     kill_switch: bool = False
+    unit_type: Literal["guest_id", "device_id"] = "guest_id"
+    targeting: Targeting = Field(default_factory=Targeting)
+    passport_id: Optional[str] = None
+    passport_version: Optional[int] = Field(None, ge=1)
+    passport_hash: Optional[str] = None
 
     @field_validator("variants")
     @classmethod
@@ -84,6 +93,10 @@ class ExperimentRule(BaseModel):
     @property
     def control_variant_id(self) -> str:
         return next(v.variant_id for v in self.variants if v.is_control)
+
+    def params_of(self, variant_id: str) -> Dict[str, Any]:
+        """Параметры варианта (PRM-1); для неизвестного варианта — пусто."""
+        return next((v.params for v in self.variants if v.variant_id == variant_id), {})
 
     def overlaps(self, other: "ExperimentRule") -> bool:
         return self.layer_id == other.layer_id and self.slot_start < other.slot_end and other.slot_start < self.slot_end
@@ -117,6 +130,7 @@ class Ruleset(BaseModel):
     experiments: List[ExperimentRule] = Field(default_factory=list)
     _layers: Dict[str, Layer] = PrivateAttr(default_factory=dict)
     _flags: Dict[str, ExperimentRule] = PrivateAttr(default_factory=dict)
+    _by_layer: Dict[str, List[ExperimentRule]] = PrivateAttr(default_factory=dict)
 
     @model_validator(mode="before")
     @classmethod
@@ -138,16 +152,36 @@ class Ruleset(BaseModel):
             e.salt for e in self.experiments
         }:
             raise ValueError("Соли holdout, слоёв и экспериментов не должны совпадать.")
-        problems = []
-        for i, e in enumerate(self.experiments):
-            if e.layer_id not in layer_ids:
-                problems.append(f"эксперимент '{e.experiment_id}' ссылается на неизвестный слой '{e.layer_id}'")
-            problems += lane_conflicts(e, self.experiments[:i])
+        problems = [f"эксперимент '{e.experiment_id}' ссылается на неизвестный слой '{e.layer_id}'"
+                    for e in self.experiments if e.layer_id not in layer_ids]
+        by_layer: Dict[str, List[ExperimentRule]] = {}
+        for e in self.experiments:
+            by_layer.setdefault(e.layer_id, []).append(e)
+        if self._has_conflicts(by_layer):
+            # подробные тексты — попарным сравнением; до него доходит только некорректный ruleset
+            for i, e in enumerate(self.experiments):
+                problems += lane_conflicts(e, self.experiments[:i])
         if problems:
             raise ValueError("Некорректный ruleset: " + "; ".join(problems))
         self._layers = {l.layer_id: l for l in self.layers}
         self._flags = {e.flag_key: e for e in self.experiments}
+        self._by_layer = by_layer
         return self
+
+    def _has_conflicts(self, by_layer: Dict[str, List[ExperimentRule]]) -> bool:
+        """Есть ли повторы идентификаторов, флагов, солей или пересечения дорожек — за O(n log n)."""
+        n = len(self.experiments)
+        if len({e.experiment_id for e in self.experiments}) != n or len({e.flag_key for e in self.experiments}) != n \
+                or len({e.salt for e in self.experiments}) != n:
+            return True
+        for rules in by_layer.values():
+            lanes = sorted((e.slot_start, e.slot_end) for e in rules)
+            if any(prev_end > start for (_, prev_end), (start, _) in zip(lanes, lanes[1:])):
+                return True
+        return False
+
+    def rules_by_layer(self) -> Dict[str, List[ExperimentRule]]:
+        return self._by_layer
 
     def canonical_json(self) -> str:
         return json.dumps(self.model_dump(mode="json", exclude={"etag"}), ensure_ascii=False, sort_keys=True,

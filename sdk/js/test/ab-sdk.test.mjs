@@ -6,7 +6,7 @@ import { test } from "node:test";
 import {
   ExperimentClient, FALLBACK_INVALID_UNIT, FALLBACK_NO_RULESET, FALLBACK_STALE, FALLBACK_UNKNOWN_FLAG,
   SMHASHER_VERIFICATION_X86_32, allocateVariantBuckets, bucket, evaluate, murmurhash3_x86_32, parseRuleset,
-  pctToBuckets, rampEnd, roundHalfEven, smhasherSelfTest,
+  asciiLower, compareVersions, knownAttributes, parseVersion, pctToBuckets, rampEnd, roundHalfEven, smhasherSelfTest,
 } from "../ab-sdk.mjs";
 
 const V = JSON.parse(readFileSync(new URL("../../../tests/vectors/assignment_vectors.json", import.meta.url), "utf8"));
@@ -34,13 +34,28 @@ test("округление и нарезка как в Python (половина 
 test("все назначения векторов совпадают (100%)", () => {
   const rss = V.rulesets.map((r) => parseRuleset(r));
   let n = 0;
+  const clients = rss.map((rs) => new ExperimentClient({ initialRuleset: rs.raw }));
+  const reasons = new Set();
   for (const c of V.cases) {
-    const r = evaluate(rss[c.rs], c.flag, c.unit);
-    assert.deepEqual([r.variantId, r.inExperiment, r.reason], [c.variant, c.in, c.reason], JSON.stringify(c));
+    const want = [c.variant, c.in, c.reason, c.params ?? {}];
+    const opts = { attributes: c.attrs ?? null, unitType: c.unit_type ?? null };
+    const r = evaluate(rss[c.rs], c.flag, c.unit, { ...opts, enrolled: c.enrolled ?? false });
+    assert.deepEqual([r.variantId, r.inExperiment, r.reason, r.params], want, JSON.stringify(c));
+    // клиент: «первый показ уже был» — его память о показах
+    const client = clients[c.rs];
+    const key = JSON.stringify([c.unit, r.experimentId]);
+    if (c.enrolled) client._enrolled.set(key, true);
+    const d = client.getVariant(c.flag, c.unit, { ...opts, logExposure: false });
+    client._enrolled.delete(key);
+    assert.deepEqual([d.variantId, d.inExperiment, d.reason, d.params], want, JSON.stringify(c));
+    reasons.add(c.reason);
     n++;
   }
   assert.equal(n, V.cases.length);
-  assert.ok(n > 1000);
+  assert.ok(n > 4000);
+  assert.equal([...reasons].filter((r) => r.startsWith("targeting")).length, 12);
+  assert.ok(reasons.has("unit_type_mismatch"));
+  assert.ok(clients.every((c) => c.pendingExposures().length === 0)); // logExposure: false показов не создаёт
 });
 
 test("bucket: некорректный ввод", () => {
@@ -254,4 +269,88 @@ test("ASG-5: p99 решения < 1 мс на 100 экспериментах", (
   lat.sort((a, b) => a - b);
   const p99 = lat[Math.floor(0.99 * lat.length)];
   assert.ok(p99 < 1_000_000, `p99 = ${p99} нс`);
+});
+
+// --- таргетинг, параметры, решение и показ (ТЗ v4.1) -------------------------------------------
+
+const IOS = { platform: "ios", app_version: "5.4" };
+
+function targetedRuleset({ kill = false } = {}) {
+  return {
+    version: 1,
+    holdout: { salt: "global_holdout_v1", pct: 0 },
+    layers: [{ layer_id: "L", salt: "layer:L", marketing: true, kind: "platform" }],
+    experiments: [{
+      experiment_id: "exp", flag_key: "exp", layer_id: "L", slot_start: 0, slot_end: 10000, ramp_pct: 100, salt: "exp",
+      kill_switch: kill, unit_type: "guest_id",
+      targeting: { platforms: ["ios"], app_version_min: "5.2", app_version_max: "5.9", cities: null, regions: null,
+        is_new_guest: null, has_delivery: null },
+      variants: [{ variant_id: "c", traffic_percentage: 50, is_control: true, params: { n: 0 } },
+        { variant_id: "t", traffic_percentage: 50, is_control: false, params: { n: 1, text: "новое" } }],
+    }],
+  };
+}
+
+test("версии и регистр: правила сравнения", () => {
+  assert.deepEqual(parseVersion("5.1.0"), [5, 1]);
+  assert.deepEqual(parseVersion("05.01"), [5, 1]);
+  assert.deepEqual(parseVersion("0.0"), [0]);
+  for (const bad of ["", "5.", ".5", "5..1", "5.1-beta", "v5", " 5.1", "5.1\n", "٥.١", "1.2.3.4.5.6.7", "1234567890", 5.1, null]) {
+    assert.equal(parseVersion(bad), null, String(bad));
+  }
+  assert.equal(compareVersions(parseVersion("5.10"), parseVersion("5.9")), 1);
+  assert.equal(compareVersions(parseVersion("5.1"), parseVersion("5.1.0")), 0);
+  assert.equal(compareVersions(parseVersion("5"), parseVersion("5.0.1")), -1);
+  assert.equal(asciiLower("IOS-Msk_1"), "ios-msk_1");
+  assert.equal(asciiLower("\u212a"), "\u212a");
+  assert.equal(asciiLower("İ"), "İ");
+  assert.equal(asciiLower("МСК"), "МСК");
+  assert.equal(knownAttributes(null), null);
+  assert.deepEqual(knownAttributes({ platform: "ios", is_new_guest: false, has_delivery: 1, city: null, email: "a@b" }),
+    { platform: "ios", is_new_guest: false });
+  assert.throws(() => parseRuleset({ ...targetedRuleset(), experiments: [{ ...targetedRuleset().experiments[0],
+    targeting: { app_version_min: "5.x" } }] }), /не версия/);
+});
+
+test("клиент: решение без показа, показ отдельно, снимок признаков", () => {
+  const c = new ExperimentClient({ initialRuleset: targetedRuleset() });
+  const d = c.getVariant("exp", "g1", { attributes: { ...IOS, phone: "+7900", city: 5 }, logExposure: false });
+  assert.equal(d.inExperiment, true);
+  assert.deepEqual(d.params, d.variantId === "t" ? { n: 1, text: "новое" } : { n: 0 });
+  assert.equal(c.pendingExposures().length, 0);
+  assert.equal(c.logExposure(d, "s1"), true);
+  assert.equal(c.logExposure(d, "s1"), false);
+  assert.equal(c.logExposure(d, "s2"), true);
+  const [e1, e2] = c.pendingExposures();
+  assert.deepEqual([e1.session_id, e2.session_id], ["s1", "s2"]);
+  assert.deepEqual(e1.attributes, IOS);
+  assert.equal(e1.unit_type, "guest_id");
+  const fresh = new ExperimentClient({ initialRuleset: targetedRuleset() });
+  const out = fresh.getVariant("exp", "g1", { attributes: { platform: "web" } });
+  assert.deepEqual([out.variantId, out.inExperiment, out.reason, out.params], ["c", false, "targeting:platform", { n: 0 }]);
+  assert.equal(fresh.getVariant("exp", "g1").reason, "targeting_missing:platform");
+  assert.equal(fresh.getVariant("exp", "g1", { attributes: IOS, unitType: "device_id", logExposure: false }).reason,
+    "unit_type_mismatch");
+  assert.equal(fresh.logExposure(out), false);
+  assert.equal(fresh.logExposure(null), false);
+  assert.equal(fresh.pendingExposures().length, 0);
+  assert.deepEqual(fresh.getVariant("нет", "g1").params, {});
+});
+
+test("клиент: после первого показа гость остаётся в тесте (TGT-3)", () => {
+  const updated = { platform: "ios", app_version: "6.0" };
+  const c = new ExperimentClient({ initialRuleset: targetedRuleset() });
+  assert.equal(c.getVariant("exp", "g1", { attributes: updated }).reason, "targeting:app_version");
+  const first = c.getVariant("exp", "g1", { attributes: IOS, sessionId: "s1" });
+  const after = c.getVariant("exp", "g1", { attributes: updated, sessionId: "s2" });
+  assert.equal(first.inExperiment && after.inExperiment, true);
+  assert.equal(after.variantId, first.variantId);
+  assert.equal(c.pendingExposures().length, 2);
+  assert.equal(c.getVariant("exp", "g2", { attributes: updated }).reason, "targeting:app_version");
+  // решение без показа не закрепляет; kill-switch сильнее закрепления
+  const d = new ExperimentClient({ initialRuleset: targetedRuleset() });
+  d.getVariant("exp", "g1", { attributes: IOS, logExposure: false });
+  assert.equal(d.getVariant("exp", "g1", { attributes: updated }).reason, "targeting:app_version");
+  c._ruleset = parseRuleset(targetedRuleset({ kill: true }));
+  assert.equal(c.getVariant("exp", "g1", { attributes: updated }).reason, "kill_switch");
 });

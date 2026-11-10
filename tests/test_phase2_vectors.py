@@ -14,7 +14,7 @@ import pytest
 from ab_platform.engine.assignment import (
     allocate_variant_buckets, murmurhash3_x86_32, pct_to_buckets, ramp_range, smhasher_self_test,
 )
-from ab_platform.engine.ruleset_engine import evaluate
+from ab_platform.engine.ruleset_engine import evaluate, evaluate_all
 from ab_platform.schemas.ruleset import Ruleset
 from ab_platform.sdk import ExperimentClient
 from tests.test_phase2_http import Stand
@@ -44,13 +44,27 @@ def test_all_cases_match_engine_and_sdk():
     # ruleset в векторах — ровно то, что отдаёт сервер: etag в файле совпадает с вычисленным
     assert [r.etag for r in rss] == [r["etag"] for r in V["rulesets"]]
     clients = [ExperimentClient(initial_ruleset=r) for r in rss]
+    position = [{e.flag_key: i for i, e in enumerate(r.experiments)} for r in rss]
     for c in V["cases"]:
-        rs = rss[c["rs"]]
-        e = evaluate(rs, rs.by_flag(c["flag"]), c["unit"])
-        assert (e.variant_id, e.is_exposed, e.reason) == (c["variant"], c["in"], c["reason"]), c
-        d = clients[c["rs"]].get_variant(c["flag"], c["unit"])
-        assert (d.variant_id, d.in_experiment, d.reason) == (c["variant"], c["in"], c["reason"]), c
-    assert {c["reason"] for c in V["cases"]} == {"assigned", "holdout", "not_in_lane", "ramp", "kill_switch"}
+        rs, want = rss[c["rs"]], (c["variant"], c["in"], c["reason"])
+        rule = rs.by_flag(c["flag"])
+        attrs, unit_type, enrolled = c.get("attrs"), c.get("unit_type"), c.get("enrolled", False)
+        e = evaluate(rs, rule, c["unit"], attrs, unit_type, enrolled)
+        assert (e.variant_id, e.is_exposed, e.reason) == want, c
+        assert rule.params_of(e.variant_id) == c.get("params", {}), c
+        # все флаги за один проход (POST /decide) дают то же самое
+        a = evaluate_all(rs, c["unit"], attrs, unit_type, {rule.experiment_id} if enrolled else ())
+        assert a[position[c["rs"]][c["flag"]]] == e, c
+        # SDK: «первый показ уже был» — память клиента о показах
+        client, key = clients[c["rs"]], (c["unit"], rule.experiment_id)
+        if enrolled:
+            client._enrolled[key] = None
+        d = client.get_variant(c["flag"], c["unit"], attributes=attrs, unit_type=unit_type, log_exposure=False)
+        client._enrolled.pop(key, None)
+        assert (d.variant_id, d.in_experiment, d.reason, d.params) == (*want, c.get("params", {})), c
+    reasons = {c["reason"] for c in V["cases"]}
+    assert {"assigned", "holdout", "not_in_lane", "ramp", "kill_switch", "unit_type_mismatch"} < reasons
+    assert len({r for r in reasons if r.startswith("targeting")}) == 12  # 6 признаков × (не подошёл, нет признака)
 
 
 @pytest.mark.skipif(shutil.which("cc") is None, reason="нет C-компилятора")
