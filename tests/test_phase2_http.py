@@ -12,7 +12,10 @@ from ab_platform.engine.ruleset_engine import update_rule
 from ab_platform.schemas.ruleset import ExperimentRule, Layer, Ruleset
 from ab_platform.sdk import ExperimentClient
 from ab_platform.sdk_http import HttpExposureSink, HttpRulesetFetcher
+from ab_platform.auth import Auth
 from ab_platform.server import MAX_BATCH, ExposureStore, RulesetStore, create_app
+
+OPEN = Auth.disabled()  # стенд SDK без ключей; ключи и роли — tests/test_phase3_http.py
 
 
 def variants(*ids):
@@ -35,7 +38,7 @@ def event(i=0, **kw):
 def stand():
     rs = make_ruleset()
     store, exp = RulesetStore(rs), ExposureStore()
-    return TestClient(create_app(store, exp)), store, exp
+    return TestClient(create_app(store, exp, auth=OPEN)), store, exp
 
 
 # --- GET /ruleset --------------------------------------------------------------------------------
@@ -56,7 +59,7 @@ def test_ruleset_etag_and_304(stand):
 
 
 def test_ruleset_unpublished_and_no_rollback():
-    http = TestClient(create_app())
+    http = TestClient(create_app(auth=OPEN))
     assert http.get("/ruleset").status_code == 503
     store = RulesetStore(make_ruleset(version=3))
     with pytest.raises(ValueError, match="не новее"):
@@ -113,20 +116,21 @@ def test_bad_bodies(stand):
 
 def test_jsonl_persists_and_dedup_survives_restart(tmp_path):
     path = str(tmp_path / "exposures.jsonl")
-    http = TestClient(create_app(RulesetStore(make_ruleset()), ExposureStore(path)))
+    http = TestClient(create_app(RulesetStore(make_ruleset()), ExposureStore(path), auth=OPEN))
     http.post("/exposures", json=[event(i) for i in range(300)])
     with open(path, "a", encoding="utf-8") as f:
         f.write('{"event_id": "недопис')  # оборванная строка при аварийной остановке
     restarted = ExposureStore(path)
     assert len(restarted) == 300 and restarted.corrupt_lines == 1
-    http2 = TestClient(create_app(RulesetStore(make_ruleset()), restarted))
+    http2 = TestClient(create_app(RulesetStore(make_ruleset()), restarted, auth=OPEN))
     assert http2.post("/exposures", json=[event(i) for i in range(310)]).json()["accepted"] == 10
-    assert http2.get("/health").json() == {"ruleset_version": 1, "exposures": 310}
+    health = http2.get("/health").json()
+    assert (health["ruleset_version"], health["exposures"]) == (1, 310)
 
 
 def test_concurrent_resend_counts_each_event_once():
     exp = ExposureStore()
-    http = TestClient(create_app(RulesetStore(make_ruleset()), exp))
+    http = TestClient(create_app(RulesetStore(make_ruleset()), exp, auth=OPEN))
     batch = [event(i) for i in range(500)]
     results = []
 
@@ -162,14 +166,14 @@ def test_sdk_over_http_end_to_end(stand):
 
 def test_sdk_server_down_fail_open_and_retry():
     exp = ExposureStore()
-    app = create_app(RulesetStore(make_ruleset()), exp)
+    app = create_app(RulesetStore(make_ruleset()), exp, auth=OPEN)
     http = TestClient(app)
     c = ExperimentClient(HttpRulesetFetcher(client=http), HttpExposureSink(client=http), batch_size=10_000)
     c.refresh()
     for i in range(30):
         c.get_variant("exp_0", f"g{i}")
     # «падение» сервера: приём отвечает 500, а ruleset — 500
-    down = TestClient(create_app(_Failing(), exp), raise_server_exceptions=False)
+    down = TestClient(create_app(_Failing(), exp, auth=OPEN), raise_server_exceptions=False)
     c._fetcher, c._sink = HttpRulesetFetcher(client=down), HttpExposureSink(client=down)
     assert c.refresh() is False and c.counters["refresh_error"] == 1
     assert c.get_variant("exp_0", "g1").variant_id in {"A", "B"}  # ruleset ещё свежий — решение локальное
@@ -201,12 +205,17 @@ def test_http_fetcher_owns_client_and_network_error():
 class Stand:
     """Настоящий HTTP-сервер uvicorn на свободном порту в фоновом потоке."""
 
-    def __init__(self, ruleset):
-        self.store, self.exposures = RulesetStore(ruleset), ExposureStore()
+    def __init__(self, ruleset=None, app=None):
+        """ruleset — стенд SDK без ключей; app — готовое приложение (контур управления, ключи)."""
+        if app is None:
+            self.store, self.exposures = RulesetStore(ruleset), ExposureStore()
+            app = create_app(self.store, self.exposures, auth=OPEN)
+        else:
+            self.store, self.exposures = app.state.rulesets, app.state.exposures
         self.sock = socket.socket()
         self.sock.bind(("127.0.0.1", 0))
         self.url = f"http://127.0.0.1:{self.sock.getsockname()[1]}"
-        self.server = uvicorn.Server(uvicorn.Config(create_app(self.store, self.exposures), log_level="warning"))
+        self.server = uvicorn.Server(uvicorn.Config(app, log_level="warning"))
         self.thread = threading.Thread(target=self.server.run, kwargs={"sockets": [self.sock]}, daemon=True)
 
     def __enter__(self):

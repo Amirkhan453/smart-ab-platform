@@ -29,6 +29,8 @@ export const FALLBACK_NO_RULESET = "fallback:no_ruleset";
 export const FALLBACK_STALE = "fallback:stale_ruleset";
 export const FALLBACK_UNKNOWN_FLAG = "fallback:unknown_flag";
 export const FALLBACK_INVALID_UNIT = "fallback:invalid_unit_id";
+export const FALLBACK_DECIDE_UNAVAILABLE = "fallback:decide_unavailable";
+export const FALLBACK_STALE_DECISION = "fallback:stale_decision";
 
 const ENCODER = new TextEncoder();
 
@@ -291,11 +293,15 @@ export function evaluate(ruleset, flagKey, unitId, { attributes = null, unitType
 // --- HTTP-транспорт -----------------------------------------------------------------------------
 
 /** Источник ruleset: GET {baseUrl}/ruleset с If-None-Match. */
-export function createHttpFetcher(baseUrl, { timeoutMs = 5000, fetchImpl = globalThis.fetch } = {}) {
+function authHeader(apiKey) {
+  return apiKey ? { Authorization: `Bearer ${apiKey}` } : {};
+}
+
+export function createHttpFetcher(baseUrl, { timeoutMs = 5000, fetchImpl = globalThis.fetch, apiKey = null } = {}) {
   const url = `${baseUrl.replace(/\/+$/, "")}/ruleset`;
   return {
     async fetch(ifNoneMatch) {
-      const headers = ifNoneMatch ? { "If-None-Match": `"${ifNoneMatch}"` } : {};
+      const headers = { ...authHeader(apiKey), ...(ifNoneMatch ? { "If-None-Match": `"${ifNoneMatch}"` } : {}) };
       const r = await fetchImpl(url, { headers, signal: AbortSignal.timeout(timeoutMs) });
       const etag = r.headers.get("etag")?.replace(/^W\//, "").replace(/"/g, "") ?? null;
       return { status: r.status, body: r.status === 200 ? await r.text() : null, etag };
@@ -304,12 +310,12 @@ export function createHttpFetcher(baseUrl, { timeoutMs = 5000, fetchImpl = globa
 }
 
 /** Отправка exposure: POST {baseUrl}/exposures. Не-2xx → исключение (SDK повторит пачку). */
-export function createHttpSink(baseUrl, { timeoutMs = 5000, fetchImpl = globalThis.fetch } = {}) {
+export function createHttpSink(baseUrl, { timeoutMs = 5000, fetchImpl = globalThis.fetch, apiKey = null } = {}) {
   const url = `${baseUrl.replace(/\/+$/, "")}/exposures`;
   const sink = async (batch) => {
     const r = await fetchImpl(url, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...authHeader(apiKey) },
       body: JSON.stringify(batch),
       signal: AbortSignal.timeout(timeoutMs),
     });
@@ -319,6 +325,154 @@ export function createHttpSink(baseUrl, { timeoutMs = 5000, fetchImpl = globalTh
   };
   sink.rejected = [];
   return sink;
+}
+
+// --- клиент API решений -------------------------------------------------------------------------
+
+/**
+ * Тонкий клиент POST /decide (ТЗ v4.1: DEC-1…3) — когда решение считает сервер, а не локальный SDK.
+ *
+ *   const client = createRemoteClient(url, { apiKey, storage: localStorage });
+ *   const d = await client.decide(guestId, "guest_id", { platform: "ios", app_version: "5.4" });
+ *   const menu = d.get("flag_menu");            // { variantId, params, reason, inExperiment, ... }
+ *   client.expose(menu, sessionId);             // когда гость реально увидел изменение — и в контроле тоже
+ *   await client.flush();
+ *
+ * Fail-open: тайм-аут или сбой → последние решения этого гостя из storage, если они не старше maxStaleMs;
+ * иначе контроль с причиной fallback:*. Не бросает исключений. storage — объект с getItem/setItem
+ * (localStorage, обёртка над хранилищем устройства); по умолчанию — память процесса.
+ */
+export function createRemoteClient(baseUrl, {
+  apiKey = null, timeoutMs = 1000, fetchImpl = globalThis.fetch, storage = null, maxStaleMs = 3_600_000,
+  batchSize = 100, maxBuffer = 10_000, now = () => Date.now(),
+} = {}) {
+  const base = baseUrl.replace(/\/+$/, "");
+  const memory = new Map();
+  const store = storage ?? { getItem: (k) => memory.get(k) ?? null, setItem: (k, v) => void memory.set(k, v) };
+  const headers = { "Content-Type": "application/json", ...authHeader(apiKey) };
+  const seen = new Map();
+  const client = {
+    decisions: {},
+    counters: { decide_ok: 0, decide_error: 0, cache_hit: 0, sent: 0, sink_error: 0, dropped: 0 },
+    lastError: null,
+    rejected: [],
+    _buffer: [],
+
+    async decide(unitId, unitType, attributes = null) {
+      const key = `abp:decide:${unitType}:${unitId}`;
+      try {
+        const r = await fetchImpl(`${base}/decide`, {
+          method: "POST", headers, signal: AbortSignal.timeout(timeoutMs),
+          body: JSON.stringify({ unit_id: unitId, unit_type: unitType, attributes }),
+        });
+        if (!r.ok) throw new Error(`статус ${r.status}`);
+        const body = await r.json();
+        const snapshot = { at: now(), ruleset_version: body.ruleset_version, decisions: body.decisions };
+        try {
+          store.setItem(key, JSON.stringify(snapshot));
+        } catch { /* переполненное хранилище устройства не должно ломать решение */ }
+        client.counters.decide_ok += 1;
+        return wrap(unitId, unitType, attributes, snapshot, null, false);
+      } catch (err) {
+        client.counters.decide_error += 1;
+        client.lastError = `${err?.name ?? "Error"}: ${err?.message ?? err}`;
+      }
+      let snapshot = null;
+      try {
+        snapshot = JSON.parse(store.getItem(key));
+      } catch { /* нет записи или она повреждена */ }
+      if (!snapshot || !Array.isArray(snapshot.decisions)) {
+        return wrap(unitId, unitType, attributes, null, FALLBACK_DECIDE_UNAVAILABLE, false);
+      }
+      if (now() - (snapshot.at ?? 0) > maxStaleMs) {
+        return wrap(unitId, unitType, attributes, null, FALLBACK_STALE_DECISION, false);
+      }
+      client.counters.cache_hit += 1;
+      return wrap(unitId, unitType, attributes, snapshot, null, true);
+    },
+
+    /** Показ по решению. false — гость вне теста или показ в этой сессии уже учтён. */
+    expose(decision, sessionId = null) {
+      if (!decision || !decision.inExperiment || decision.experimentId == null || decision.rulesetVersion == null) {
+        return false;
+      }
+      const key = JSON.stringify([decision.unitId, decision.experimentId, sessionId]);
+      if (seen.has(key)) return false;
+      seen.set(key, true);
+      if (seen.size > 100_000) seen.delete(seen.keys().next().value);
+      if (client._buffer.length >= maxBuffer) {
+        client._buffer.shift();
+        client.counters.dropped += 1;
+      }
+      client._buffer.push({
+        event_id: uuid4(), event_time: new Date().toISOString(), unit_id: decision.unitId,
+        experiment_id: decision.experimentId, variant_id: decision.variantId,
+        ruleset_version: decision.rulesetVersion, session_id: sessionId, unit_type: decision.unitType ?? null,
+        attributes: decision.attributes ?? null,
+      });
+      if (client._buffer.length % batchSize === 0) void client.flush();
+      return true;
+    },
+
+    /** Отправить показы. При сбое они остаются в буфере; повтор идемпотентен по event_id. */
+    async flush() {
+      if (client._buffer.length === 0) return 0;
+      const batch = client._buffer;
+      client._buffer = [];
+      try {
+        const r = await fetchImpl(`${base}/exposures`, {
+          method: "POST", headers, body: JSON.stringify(batch), signal: AbortSignal.timeout(timeoutMs),
+        });
+        if (!r.ok) throw new Error(`статус ${r.status}`);
+        client.rejected.push(...((await r.json()).rejected ?? []));
+        client.counters.sent += batch.length;
+        return batch.length;
+      } catch {
+        client.counters.sink_error += 1;
+        const merged = batch.concat(client._buffer);
+        client.counters.dropped += Math.max(0, merged.length - maxBuffer);
+        client._buffer = merged.slice(-maxBuffer);
+        return 0;
+      }
+    },
+
+    pendingExposures: () => [...client._buffer],
+
+    get fallbackRate() {
+      let total = 0;
+      let fb = 0;
+      for (const [r, n] of Object.entries(client.decisions)) {
+        total += n;
+        if (r.startsWith("fallback:")) fb += n;
+      }
+      return total ? fb / total : 0;
+    },
+  };
+
+  function wrap(unitId, unitType, attributes, snapshot, fallback, fromCache) {
+    const items = new Map();
+    for (const d of snapshot?.decisions ?? []) {
+      items.set(d.flag_key, {
+        flagKey: d.flag_key, unitId, variantId: d.variant_id, inExperiment: d.in_experiment, reason: d.reason,
+        experimentId: d.experiment_id, rulesetVersion: snapshot.ruleset_version, params: d.params ?? {},
+        unitType, attributes: knownAttributes(attributes),
+      });
+    }
+    return {
+      unitId, unitType, fallback, fromCache,
+      flags: () => [...items.keys()],
+      get(flagKey, defaultVariant = "control") {
+        const d = items.get(flagKey) ?? {
+          flagKey, unitId, variantId: defaultVariant, inExperiment: false, reason: fallback ?? FALLBACK_UNKNOWN_FLAG,
+          experimentId: null, rulesetVersion: null, params: {}, unitType, attributes: null,
+        };
+        client.decisions[d.reason] = (client.decisions[d.reason] ?? 0) + 1;
+        return d;
+      },
+    };
+  }
+
+  return client;
 }
 
 // --- клиент -------------------------------------------------------------------------------------

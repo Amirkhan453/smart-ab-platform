@@ -11,7 +11,8 @@
 Новая версия Паспорта — новая рандомизация: experiment_id правила = "<id>@v<версия>", он же соль варианта.
 """
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence
+import threading
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from ab_platform.engine.ruleset_engine import launch, update_rule
 from ab_platform.schemas.passport import (
@@ -121,10 +122,26 @@ class ExperimentService:
         self.storage = storage
         self._matrix = {k: list(v) for k, v in (intersection_matrix or {}).items()}
         self._default_holdout_pct = default_holdout_pct
+        self._cache_lock = threading.Lock()
+        self._cached: Optional[Tuple[Ruleset, str]] = None
 
     # ---------------- чтение ----------------
     def ruleset(self) -> Optional[Ruleset]:
         return self.storage.latest_ruleset()
+
+    def current(self) -> Optional[Tuple[Ruleset, str]]:
+        """
+        Действующий ruleset и его JSON для раздачи SDK. Разбор — один раз на версию: на каждый запрос
+        идёт только проверка номера последней версии в хранилище.
+        """
+        version = self.storage.latest_ruleset_version()
+        if version is None:
+            return None
+        with self._cache_lock:
+            if self._cached is None or self._cached[0].version != version:
+                ruleset = self.storage.get_ruleset(version)
+                self._cached = (ruleset, ruleset.to_json())
+            return self._cached
 
     def get(self, experiment_id: str, version: Optional[int] = None) -> ExperimentPassport:
         passport = self.storage.get_passport(experiment_id, version)

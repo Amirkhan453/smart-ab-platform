@@ -14,6 +14,8 @@ export const FALLBACK_NO_RULESET: "fallback:no_ruleset";
 export const FALLBACK_STALE: "fallback:stale_ruleset";
 export const FALLBACK_UNKNOWN_FLAG: "fallback:unknown_flag";
 export const FALLBACK_INVALID_UNIT: "fallback:invalid_unit_id";
+export const FALLBACK_DECIDE_UNAVAILABLE: "fallback:decide_unavailable";
+export const FALLBACK_STALE_DECISION: "fallback:stale_decision";
 
 export type Reason =
   | "assigned"
@@ -28,6 +30,8 @@ export type Reason =
   | "fallback:stale_ruleset"
   | "fallback:unknown_flag"
   | "fallback:invalid_unit_id"
+  | "fallback:decide_unavailable"
+  | "fallback:stale_decision"
   | `fallback:exception:${string}`;
 
 export type TargetingAttribute = "platform" | "app_version" | "city" | "region" | "is_new_guest" | "has_delivery";
@@ -161,7 +165,53 @@ export type ExposureSink = (batch: ExposureEvent[]) => Promise<void> | void;
 export interface HttpOptions {
   timeoutMs?: number;
   fetchImpl?: typeof fetch;
+  /** Ключ доступа SDK: уходит заголовком Authorization: Bearer. */
+  apiKey?: string | null;
 }
+
+export interface RemoteClientOptions extends HttpOptions {
+  /** Хранилище последних решений на устройстве (localStorage или обёртка); по умолчанию — память. */
+  storage?: { getItem(key: string): string | null; setItem(key: string, value: string): void } | null;
+  /** Старше — кэш не используется, отдаётся контроль (fallback:stale_decision). */
+  maxStaleMs?: number;
+  batchSize?: number;
+  maxBuffer?: number;
+  now?: () => number;
+}
+
+/** Решения одного гостя от POST /decide. */
+export interface RemoteDecisions {
+  readonly unitId: string;
+  readonly unitType: UnitType;
+  /** Причина, если сервер недоступен и кэша нет; иначе null. */
+  readonly fallback: Reason | null;
+  readonly fromCache: boolean;
+  flags(): string[];
+  /** Неизвестный флаг или сбой → defaultVariant с причиной fallback:*. */
+  get(flagKey: string, defaultVariant?: string): Decision;
+}
+
+export interface RemoteClient {
+  readonly decisions: Record<string, number>;
+  readonly counters: {
+    decide_ok: number;
+    decide_error: number;
+    cache_hit: number;
+    sent: number;
+    sink_error: number;
+    dropped: number;
+  };
+  readonly lastError: string | null;
+  readonly rejected: Array<{ index: number; error: string }>;
+  readonly fallbackRate: number;
+  /** Никогда не отклоняется: при сбое — кэш или контроль. */
+  decide(unitId: string, unitType: UnitType, attributes?: Attributes | null): Promise<RemoteDecisions>;
+  expose(decision: Decision, sessionId?: string | null): boolean;
+  flush(): Promise<number>;
+  pendingExposures(): ExposureEvent[];
+}
+
+export function createRemoteClient(baseUrl: string, options?: RemoteClientOptions): RemoteClient;
 
 export function createHttpFetcher(baseUrl: string, options?: HttpOptions): RulesetFetcher;
 export function createHttpSink(baseUrl: string, options?: HttpOptions): ExposureSink & { rejected: Array<{ index: number; error: string }> };

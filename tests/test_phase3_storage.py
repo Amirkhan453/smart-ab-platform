@@ -94,7 +94,7 @@ def test_versions_go_in_order_and_listing_returns_latest(store):
 
 # ---------------- ruleset ----------------
 def test_ruleset_versions_are_append_only_and_sequential(store):
-    assert store.latest_ruleset() is None and store.get_ruleset(1) is None
+    assert store.latest_ruleset() is None and store.get_ruleset(1) is None and store.latest_ruleset_version() is None
     r5 = ruleset(5, n=3)  # первая версия может быть любой, дальше — строго +1
     store.save_ruleset(r5)
     for bad in (ruleset(5), ruleset(4), ruleset(7)):
@@ -102,6 +102,7 @@ def test_ruleset_versions_are_append_only_and_sequential(store):
             store.save_ruleset(bad)
     store.save_ruleset(ruleset(6))
     latest = store.latest_ruleset()
+    assert store.latest_ruleset_version() == 6
     assert latest.version == 6 and store.get_ruleset(5) == r5 and store.get_ruleset(5).etag == r5.etag
     assert store.get_ruleset(5).experiments[2].targeting.platforms == ["ios"]
 

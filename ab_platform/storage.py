@@ -91,6 +91,7 @@ class Storage(Protocol):
     def list_passports(self) -> List[ExperimentPassport]: ...
     def save_ruleset(self, ruleset: Ruleset) -> None: ...
     def latest_ruleset(self) -> Optional[Ruleset]: ...
+    def latest_ruleset_version(self) -> Optional[int]: ...
     def get_ruleset(self, version: int) -> Optional[Ruleset]: ...
     def append_audit(self, actor: str, action: str, experiment_id: Optional[str] = None,
                      details: Optional[Dict[str, Any]] = None) -> AuditRecord: ...
@@ -152,6 +153,10 @@ class MemoryStorage:
     def latest_ruleset(self) -> Optional[Ruleset]:
         with self._lock:
             return self._rulesets[-1] if self._rulesets else None
+
+    def latest_ruleset_version(self) -> Optional[int]:
+        with self._lock:
+            return self._rulesets[-1].version if self._rulesets else None
 
     def get_ruleset(self, version: int) -> Optional[Ruleset]:
         with self._lock:
@@ -303,6 +308,11 @@ class SqliteStorage:
         with self._lock:
             row = self._conn.execute("SELECT body FROM rulesets ORDER BY version DESC LIMIT 1").fetchone()
         return Ruleset.from_json(row[0]) if row else None
+
+    def latest_ruleset_version(self) -> Optional[int]:
+        """Дешёвая проверка «не вышла ли новая версия» — без разбора ruleset."""
+        with self._lock:
+            return self._conn.execute("SELECT MAX(version) FROM rulesets").fetchone()[0]
 
     def get_ruleset(self, version: int) -> Optional[Ruleset]:
         with self._lock:

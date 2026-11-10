@@ -356,3 +356,18 @@ def test_every_command_is_audited_and_chain_is_valid(svc):
     assert svc.storage.audit()[0].action == "layer.add" and svc.storage.verify_audit() == len(svc.storage.audit())
     # версии ruleset в аудите совпадают с сохранёнными
     assert [r.details["ruleset_version"] for r in log[4:]] == [2, 3, 4, 5, 6] and svc.ruleset().version == 6
+
+
+def test_current_ruleset_is_cached_per_version(svc):
+    """Раздача SDK: ruleset разбирается один раз на версию, новая версия видна сразу после команды."""
+    first = svc.current()
+    assert first[0].version == 1 and first[1] == first[0].to_json() and svc.current() is first
+    approved(svc)
+    assert svc.current() is first  # Паспорт без запуска ruleset не меняет
+    svc.start(OWNER, "exp_menu")
+    second = svc.current()
+    assert second[0].version == 2 and second[0] == svc.ruleset() and svc.current() is second
+    with pytest.raises(ControlError):
+        svc.ramp(OWNER, "exp_menu", 30)  # отклонённая команда версию не меняет
+    assert svc.current() is second
+    assert ExperimentService(MemoryStorage()).current() is None
