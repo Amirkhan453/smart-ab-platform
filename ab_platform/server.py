@@ -10,29 +10,31 @@ HTTP-сервер гостевого домена (ТЗ v4: ASG-7, DAT-1; ТЗ v
 Маршруты управления (ключи людей, права — по ролям ТЗ 2.1): Паспорта, команды жизненного цикла, слои, аудит.
 Маршрута «опубликовать ruleset» нет: правило появляется только из утверждённого Паспорта (LNK-1).
 
-Показы хранятся в памяти и (необязательно) в jsonl; общее хранилище событий — фаза 4, ClickHouse — фаза 6.
+- POST /orders, /order-adjustments (ключ ingest) и /app-events (ключи sdk и ingest) — события для метрик.
+События хранятся в ab_platform/events.py (SQLite; ClickHouse — фаза 6).
 
 Запуск: uvicorn "ab_platform.server:create_app_from_env" --factory
   ABP_DB_PATH — файл базы контура управления; ABP_API_KEYS — ключи (см. ab_platform/auth.py);
-  ABP_EXPOSURES_PATH — jsonl показов (необязательно).
+  ABP_EVENTS_DB_PATH — файл базы событий (показы, заказы, корректировки, события приложения).
 """
 import json
 import os
 import threading
-from datetime import datetime
-from typing import Any, Dict, FrozenSet, List, Literal, Optional, Set, Tuple, Union
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
 from fastapi import Body, FastAPI, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, StrictBool, StrictStr, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from ab_platform.auth import Auth
 from ab_platform.control import Actor, ControlError, ExperimentService, verify_ruleset
 from ab_platform.engine.ruleset_engine import evaluate_all
 from ab_platform.schemas.ruleset import Ruleset
+from ab_platform.events import (  # noqa: F401 — ExposureIn и ExposureStore импортируют отсюда тесты фаз 2–3
+    AppEventIn, ExposureIn, ExposureStore, MemoryEventStore, OrderAdjustmentIn, OrderIn, SqliteEventStore,
+)
 from ab_platform.storage import SqliteStorage
-from ab_platform.schemas.targeting import ATTRIBUTES
 
 MAX_BATCH = 10_000
 MAX_UNIT_ID_LENGTH = 1024
@@ -58,102 +60,6 @@ class RulesetStore:
 
     def current(self) -> Optional[Tuple[Ruleset, str]]:
         return self._current
-
-
-class ExposureIn(BaseModel):
-    """Exposure на входе: event_id, event_time (с часовым поясом) и ruleset_version обязательны."""
-    model_config = ConfigDict(extra="forbid")
-    event_id: str = Field(..., min_length=1, max_length=128)
-    event_time: AwareDatetime
-    unit_id: str = Field(..., min_length=1)
-    experiment_id: str = Field(..., min_length=1)
-    variant_id: str = Field(..., min_length=1)
-    ruleset_version: int = Field(..., ge=1)
-    session_id: Optional[str] = None
-    unit_type: Optional[Literal["guest_id", "device_id"]] = None
-    attributes: Optional[Dict[str, Union[StrictBool, StrictStr]]] = Field(
-        None, description="Снимок признаков таргетинга на момент показа — для SRM по сегментам (TGT-5)"
-    )
-
-    @field_validator("attributes")
-    @classmethod
-    def _only_targeting_attributes(cls, v):
-        if v is not None and (set(v) - set(ATTRIBUTES) or any(isinstance(x, str) and len(x) > 64 for x in v.values())):
-            raise ValueError(f"допустимы только признаки {list(ATTRIBUTES)} длиной до 64 знаков")
-        return v
-
-
-class ExposureStore:
-    """Хранилище exposure, идемпотентное по event_id. path — jsonl для сохранения между перезапусками."""
-
-    def __init__(self, path: Optional[str] = None):
-        self._lock = threading.Lock()
-        self._events: Dict[str, dict] = {}
-        self._by_unit: Dict[str, Set[str]] = {}  # гость → тесты, где у него уже был показ (TGT-3)
-        self.path = path
-        self.corrupt_lines = 0
-        if path and os.path.exists(path):
-            with open(path, encoding="utf-8") as f:
-                for line in f:
-                    try:
-                        ev = json.loads(line)
-                        if ev["event_id"] not in self._events:
-                            self._events[ev["event_id"]] = ev
-                            self._by_unit.setdefault(ev["unit_id"], set()).add(ev["experiment_id"])
-                    except (ValueError, KeyError, TypeError):
-                        self.corrupt_lines += 1  # недописанная строка при аварийной остановке
-
-    def add(self, events: List[ExposureIn]) -> Tuple[int, int]:
-        """Возвращает (принято новых, дубликатов). Дубликат внутри пачки тоже считается дубликатом."""
-        accepted, duplicates, new = 0, 0, []
-        with self._lock:
-            for e in events:
-                if e.event_id in self._events:
-                    duplicates += 1
-                    continue
-                row = e.model_dump(mode="json")
-                self._events[e.event_id] = row
-                self._by_unit.setdefault(e.unit_id, set()).add(e.experiment_id)
-                new.append(row)
-                accepted += 1
-            if self.path and new:
-                with open(self.path, "a", encoding="utf-8") as f:
-                    f.write("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in new))
-        return accepted, duplicates
-
-    def __len__(self) -> int:
-        return len(self._events)
-
-    def events(self) -> List[dict]:
-        with self._lock:
-            return list(self._events.values())
-
-    def enrolled(self, unit_id: str) -> FrozenSet[str]:
-        """Тесты, в которых у гостя уже был показ: для них таргетинг не перепроверяется (TGT-3)."""
-        with self._lock:
-            return frozenset(self._by_unit.get(unit_id, ()))
-
-    def first_exposures(self, experiment_id: str) -> Dict[str, dict]:
-        """
-        Первый показ каждого гостя в тесте (по времени события) — состав анализа (TGT-3): гость входит в тест
-        в момент первого показа и остаётся в нём с тем вариантом и теми признаками, что были тогда.
-        """
-        first: Dict[str, Tuple[datetime, dict]] = {}
-        for e in self.events():
-            if e["experiment_id"] != experiment_id:
-                continue
-            t = datetime.fromisoformat(e["event_time"].replace("Z", "+00:00"))
-            if e["unit_id"] not in first or t < first[e["unit_id"]][0]:
-                first[e["unit_id"]] = (t, e)
-        return {u: e for u, (_, e) in first.items()}
-
-    def counts(self) -> Dict[str, int]:
-        """Число exposure по (эксперимент, вариант) — то, что идёт в анализ."""
-        out: Dict[str, int] = {}
-        for e in self.events():
-            k = f"{e['experiment_id']}:{e['variant_id']}"
-            out[k] = out.get(k, 0) + 1
-        return out
 
 
 def _etag_matches(header: Optional[str], etag: str) -> bool:
@@ -185,6 +91,8 @@ class _HttpError(Exception):
 
 
 _CONTROL_STATUS = {"forbidden": 403, "not_found": 404, "conflict": 409, "invalid": 422}
+# Показы и события приложения: приложение (sdk) и серверная интеграция (ingest); люди событий не пишут.
+EVENT_WRITERS = ("sdk", "ingest")
 
 
 def create_app(ruleset_store: Optional[RulesetStore] = None,
@@ -228,10 +136,10 @@ def create_app(ruleset_store: Optional[RulesetStore] = None,
         if auth.is_disabled:
             raise _HttpError(403, "управление недоступно в режиме стенда без ключей")
         actor = caller(request)
-        if actor.role == "sdk":
+        if actor.role in EVENT_WRITERS:
             service.storage.append_audit(actor.subject, "auth.denied", None,
-                                         {"path": request.url.path, "reason": "ключ SDK на маршруте управления"})
-            raise _HttpError(403, "ключ SDK не даёт доступа к управлению")
+                                         {"path": request.url.path, "reason": f"ключ {actor.role} на маршруте управления"})
+            raise _HttpError(403, f"ключ {actor.role} не даёт доступа к управлению")
         return actor
 
     def command(request: Request, experiment_id: Optional[str], fn) -> Any:
@@ -282,34 +190,81 @@ def create_app(ruleset_store: Optional[RulesetStore] = None,
         return JSONResponse({"ruleset_version": rs.version, "unit_id": body.unit_id, "unit_type": body.unit_type,
                              "decisions": decisions})
 
-    @app.post("/exposures")
-    async def post_exposures(request: Request) -> Response:
-        caller(request)
+    async def batch(request: Request, model) -> Tuple[List[Any], List[Dict[str, Any]], List[int]]:
+        """Пачка событий: (корректные, отклонённые с причиной, исходные номера корректных)."""
         try:
             payload: Any = json.loads(await request.body())
         except ValueError:
-            return JSONResponse({"detail": "тело не JSON"}, status_code=400)
+            raise _HttpError(400, "тело не JSON")
         if isinstance(payload, dict):
             payload = payload.get("events")
         if not isinstance(payload, list):
-            return JSONResponse({"detail": "ожидается список событий или {\"events\": [...]}"}, status_code=400)
+            raise _HttpError(400, "ожидается список событий или {\"events\": [...]}")
         if len(payload) > MAX_BATCH:
-            return JSONResponse({"detail": f"пачка больше {MAX_BATCH} событий"}, status_code=413)
-        valid, rejected = [], []
+            raise _HttpError(413, f"пачка больше {MAX_BATCH} событий")
+        valid, rejected, index = [], [], []
         for i, raw in enumerate(payload):
             try:
-                valid.append(ExposureIn.model_validate(raw))
+                valid.append(model.model_validate(raw))
+                index.append(i)
             except ValidationError as exc:
                 rejected.append({"index": i, "error": "; ".join(
                     f"{'.'.join(map(str, err['loc']))}: {err['msg']}" for err in exc.errors())})
+        return valid, rejected, index
+
+    def writer(request: Request, roles: Tuple[str, ...], what: str) -> Actor:
+        """Запись событий: только перечисленные роли. Ключ приложения не пишет заказы (его можно извлечь)."""
+        actor = caller(request)
+        if actor.role not in roles:
+            if service is not None:
+                service.storage.append_audit(actor.subject, "auth.denied", None,
+                                             {"path": request.url.path, "role": actor.role, "reason": what})
+            raise _HttpError(403, f"роль '{actor.role}' не может {what}; нужна: {', '.join(roles)}")
+        return actor
+
+    def ingested(result, rejected: List[Dict[str, Any]], index: List[int]) -> JSONResponse:
+        # номера конфликтов — в исходной пачке, а не среди корректных
+        conflicts = [{**c, "index": index[c["index"]]} for c in result.conflicts]
+        return JSONResponse({"accepted": result.accepted, "duplicates": result.duplicates, "conflicts": conflicts,
+                             "rejected": rejected})
+
+    @app.post("/exposures")
+    async def post_exposures(request: Request) -> Response:
+        writer(request, EVENT_WRITERS, "записывать показы")
+        valid, rejected, _ = await batch(request, ExposureIn)
         accepted, duplicates = exposures.add(valid)
         return JSONResponse({"accepted": accepted, "duplicates": duplicates, "rejected": rejected})
+
+    @app.post("/orders")
+    async def post_orders(request: Request) -> Response:
+        writer(request, ("ingest",), "записывать заказы")
+        valid, rejected, index = await batch(request, OrderIn)
+        return ingested(exposures.add_orders(valid), rejected, index)
+
+    @app.post("/order-adjustments")
+    async def post_adjustments(request: Request) -> Response:
+        writer(request, ("ingest",), "записывать отмены и возвраты")
+        valid, rejected, index = await batch(request, OrderAdjustmentIn)
+        return ingested(exposures.add_adjustments(valid), rejected, index)
+
+    @app.post("/app-events")
+    async def post_app_events(request: Request) -> Response:
+        writer(request, EVENT_WRITERS, "записывать события приложения")
+        valid, rejected, index = await batch(request, AppEventIn)
+        return ingested(exposures.add_app_events(valid), rejected, index)
 
     @app.get("/health")
     def health() -> Dict[str, Any]:
         cur = source.current()
         return {"ruleset_version": cur[0].version if cur else None, "exposures": len(exposures),
                 "auth": "disabled" if auth.is_disabled else "keys", "control_plane": service is not None}
+
+    @app.get("/events/health")
+    def events_health(request: Request) -> Dict[str, Any]:
+        """Сколько событий каждого вида и сколько корректировок пришло раньше своего заказа."""
+        caller(request)
+        return {"counts": exposures.counts_by_kind(), "orphan_adjustments": exposures.orphan_adjustments(),
+                "last_seq": exposures.last_seq()}
 
     # ---------------- маршруты управления ----------------
     @app.get("/passports")
@@ -391,7 +346,8 @@ def create_app(ruleset_store: Optional[RulesetStore] = None,
 
 def create_app_from_env() -> FastAPI:
     """
-    Боевой запуск: база из ABP_DB_PATH, ключи из ABP_API_KEYS. До приёма запросов проверяются цепочка аудита
+    Боевой запуск: база контура из ABP_DB_PATH, события — из ABP_EVENTS_DB_PATH, ключи из ABP_API_KEYS.
+    До приёма запросов проверяются цепочка аудита
     и соответствие ruleset Паспортам — с повреждённой базой сервер не стартует.
     """
     path = os.environ.get("ABP_DB_PATH", "").strip()
@@ -405,5 +361,7 @@ def create_app_from_env() -> FastAPI:
     problems = verify_ruleset(current, storage) if current is not None else []
     if problems:
         raise RuntimeError("Ruleset расходится с Паспортами: " + "; ".join(problems))
-    return create_app(exposure_store=ExposureStore(os.environ.get("ABP_EXPOSURES_PATH") or None), service=service,
-                      auth=auth)
+    events_path = os.environ.get("ABP_EVENTS_DB_PATH", "").strip()
+    if not events_path:
+        raise RuntimeError("Не задан ABP_EVENTS_DB_PATH — файл базы событий (показы, заказы, события приложения).")
+    return create_app(exposure_store=SqliteEventStore(events_path), service=service, auth=auth)

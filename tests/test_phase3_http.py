@@ -199,7 +199,8 @@ def test_no_route_publishes_a_ruleset():
     """LNK-1: в API нет способа записать ruleset или правило мимо Паспорта."""
     app, _ = make_app()
     writes = {(m, r.path) for r in app.routes for m in getattr(r, "methods", ()) if m in ("POST", "PUT", "PATCH", "DELETE")}
-    assert writes == {("POST", "/decide"), ("POST", "/exposures"), ("POST", "/passports"),
+    assert writes == {("POST", "/decide"), ("POST", "/exposures"), ("POST", "/passports"), ("POST", "/orders"),
+                      ("POST", "/order-adjustments"), ("POST", "/app-events"),
                       ("POST", "/passports/{experiment_id}/versions"), ("POST", "/passports/{experiment_id}/{action}"),
                       ("POST", "/layers"), ("PUT", "/holdout")}
     http = TestClient(app)
@@ -403,10 +404,10 @@ def test_local_sdk_with_api_key_against_keyed_server():
 
 # ---------------- перезапуск (LNK-3) ----------------
 def test_restart_keeps_passports_rulesets_and_audit(tmp_path, monkeypatch):
-    db, jsonl = str(tmp_path / "ab.db"), str(tmp_path / "exposures.jsonl")
+    db, jsonl = str(tmp_path / "ab.db"), str(tmp_path / "events.db")
     monkeypatch.setenv("ABP_DB_PATH", db)
     monkeypatch.setenv("ABP_API_KEYS", SPEC)
-    monkeypatch.setenv("ABP_EXPOSURES_PATH", jsonl)
+    monkeypatch.setenv("ABP_EVENTS_DB_PATH", jsonl)
     first = create_app_from_env()
     http = TestClient(first)
     running(http, ramp_plan=[10, 100])
@@ -448,6 +449,7 @@ def test_restart_keeps_passports_rulesets_and_audit(tmp_path, monkeypatch):
 def test_server_refuses_to_start_on_tampered_database(tmp_path, monkeypatch, sql, text):
     db = str(tmp_path / "ab.db")
     monkeypatch.setenv("ABP_DB_PATH", db)
+    monkeypatch.setenv("ABP_EVENTS_DB_PATH", str(tmp_path / "events.db"))
     monkeypatch.setenv("ABP_API_KEYS", SPEC)
     app = create_app_from_env()
     running(TestClient(app))

@@ -21,7 +21,8 @@ from ab_platform.schemas.passport import (
 from ab_platform.schemas.ruleset import ExperimentRule, Ruleset
 from ab_platform.storage import Storage
 
-ROLES = ("owner", "analyst", "coordinator", "finance", "admin", "reader", "sdk")
+# sdk — ключ приложения (извлекаемый); ingest — ключ серверной интеграции, единственный, кто пишет заказы
+ROLES = ("owner", "analyst", "coordinator", "finance", "admin", "reader", "sdk", "ingest")
 _UNIT_TYPE = {RandomizationUnit.USER_ID: "guest_id", RandomizationUnit.DEVICE_ID: "device_id"}
 # статусы, при которых правило Паспорта находится в ruleset
 _IN_RULESET = (PassportStatus.RUNNING, PassportStatus.PAUSED, PassportStatus.STOPPED, PassportStatus.ANALYSIS,
