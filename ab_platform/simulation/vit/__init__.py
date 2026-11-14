@@ -8,6 +8,7 @@
 
 Параметры по умолчанию — допущения порядка величины, а не данные сети.
 """
+from .app_events import AppEvents, AppParams, AppWorld, simulate_app_world
 from .config import GuestParams, KioskParams, NetworkConfig, PanelParams
 from .effects import break_data, inject
 from .guests import adopt_feature, apply_guest_effect, generate_guests
@@ -21,5 +22,5 @@ __all__ = [
     "GuestParams", "KioskParams", "NetworkConfig", "PanelParams", "Network", "Truth",
     "generate_network", "inject", "break_data", "generate_guests", "apply_guest_effect",
     "adopt_feature", "generate_kiosk_sessions", "apply_kiosk_ui", "save_network", "load_network",
-    "simulate_reference_revenue",
+    "simulate_reference_revenue", "AppParams", "AppWorld", "AppEvents", "simulate_app_world",
 ]
