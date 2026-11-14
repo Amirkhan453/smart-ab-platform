@@ -313,6 +313,23 @@ def create_app(ruleset_store: Optional[RulesetStore] = None,
             return {"ruleset_version": result.version, "status": passport.status.value, "version": passport.version}
         return dump(result)
 
+    @app.get("/metrics")
+    def list_metrics(request: Request) -> List[Dict[str, Any]]:
+        manager(request)
+        return [{**m.model_dump(mode="json"), "ref": m.ref, "metric_type": m.metric_type.value}
+                for m in service.storage.list_metrics()]
+
+    @app.get("/metrics/{ref}")
+    def get_metric(request: Request, ref: str) -> Dict[str, Any]:
+        m = command(request, None, lambda actor: service.metric(ref))
+        return {**m.model_dump(mode="json"), "ref": m.ref, "metric_type": m.metric_type.value,
+                "definition": m.definition().model_dump(mode="json")}
+
+    @app.post("/metrics")
+    def define_metric(request: Request, data: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+        m = command(request, None, lambda actor: service.define_metric(actor, data))
+        return {**m.model_dump(mode="json"), "ref": m.ref, "metric_type": m.metric_type.value}
+
     @app.post("/layers")
     def add_layer(request: Request, body: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
         if not isinstance(body.get("layer_id"), str):
@@ -357,6 +374,7 @@ def create_app_from_env() -> FastAPI:
     storage = SqliteStorage(path)
     storage.verify_audit()
     service = ExperimentService(storage)
+    service.ensure_default_metrics()
     current = service.ruleset()
     problems = verify_ruleset(current, storage) if current is not None else []
     if problems:

@@ -15,8 +15,9 @@ import threading
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from ab_platform.engine.ruleset_engine import launch, update_rule
+from ab_platform.metrics import DEFAULT_METRICS, SYSTEM_OWNER, MetricVersion, parse_ref
 from ab_platform.schemas.passport import (
-    Domain, ExperimentPassport, ExperimentType, PassportStatus, RandomizationUnit,
+    Domain, Estimand, ExperimentPassport, ExperimentType, MetricDefinition, PassportStatus, RandomizationUnit,
 )
 from ab_platform.schemas.ruleset import ExperimentRule, Ruleset
 from ab_platform.storage import Storage
@@ -208,6 +209,74 @@ class ExperimentService:
             self.storage.append_audit(actor.subject, "holdout.set", None, {"pct": pct, "ruleset_version": new.version})
             return new
 
+    # ---------------- реестр метрик (MET-1) ----------------
+    def ensure_default_metrics(self) -> int:
+        """Стартовый набор метрик версии 1 (идемпотентно). Возвращает число добавленных."""
+        created = 0
+        with self.storage.transaction():
+            for m in DEFAULT_METRICS:
+                existing = self.storage.get_metric(m.name, m.version)
+                if existing is None:
+                    self.storage.save_metric(m)
+                    self.storage.append_audit(SYSTEM_OWNER, "metric.seed", None, {"ref": m.ref})
+                    created += 1
+                elif existing.definition_hash != m.definition_hash:
+                    raise ControlError("conflict", f"В реестре {m.ref} отличается от стартового определения.")
+        return created
+
+    def metric(self, ref: str) -> MetricVersion:
+        try:
+            name, version = parse_ref(ref)
+        except ValueError as exc:
+            raise ControlError("invalid", str(exc)) from exc
+        found = self.storage.get_metric(name, version)
+        if found is None:
+            raise ControlError("not_found", f"Метрики {ref} нет в реестре.")
+        return found
+
+    def define_metric(self, actor: Actor, data: Dict[str, Any]) -> MetricVersion:
+        """Новая версия метрики (аналитик или администратор). Версию и владельца задаёт платформа."""
+        self._require(actor, "analyst", "admin")
+        data = {k: v for k, v in data.items() if k not in ("version", "owner")}
+        with self.storage.transaction():
+            latest = self.storage.get_metric(str(data.get("name", "")))
+            try:
+                metric = MetricVersion(**data, version=latest.version + 1 if latest else 1, owner=actor.subject)
+            except ValueError as exc:
+                raise ControlError("invalid", str(exc)) from exc
+            if latest is not None and latest.definition_hash == metric.definition_hash:
+                raise ControlError("conflict", f"Определение не отличается от {latest.ref}: новая версия не нужна.")
+            self.storage.save_metric(metric)
+            self.storage.append_audit(actor.subject, "metric.define", None,
+                                      {"ref": metric.ref, "definition_hash": metric.definition_hash})
+            return metric
+
+    def _check_app_launch(self, passport: ExperimentPassport) -> None:
+        """
+        Требования к запуску теста приложения (ТЗ v4.1): estimand — показанные гости (решение фазы 4, п. 4),
+        каждая метрика — версия из реестра, и определение в Паспорте совпадает с ней (MET-1).
+        """
+        if passport.estimand != Estimand.TRIGGERED:
+            raise ControlError("invalid", "Тест приложения оценивает эффект на показанных гостях: укажите "
+                                          "estimand = triggered. ITT по назначенным без журнала назначений посчитать "
+                                          "нельзя: /decide назначения не записывает.")
+        metrics = [("primary", passport.primary_metric)] + [("secondary", m) for m in passport.secondary_metrics] + [
+            ("guardrail", g.metric) for g in passport.guardrail_metrics]
+        problems = []
+        for role, m in metrics:
+            if m.registry_ref is None:
+                problems.append(f"{role} '{m.name}' не ссылается на реестр метрик")
+                continue
+            try:
+                expected = self.metric(m.registry_ref).definition()
+            except ControlError as exc:
+                problems.append(f"{role} '{m.name}': {exc}")
+                continue
+            if m != expected:
+                problems.append(f"{role} '{m.name}' расходится с определением {m.registry_ref} в реестре")
+        if problems:
+            raise ControlError("invalid", "Метрики Паспорта: " + "; ".join(problems) + ".")
+
     # ---------------- Паспорт до утверждения ----------------
     def save_draft(self, actor: Actor, data: Dict[str, Any]) -> ExperimentPassport:
         """
@@ -315,6 +384,7 @@ class ExperimentService:
             if passport.status != PassportStatus.APPROVED:
                 raise ControlError("conflict", f"Запустить можно только утверждённый Паспорт; сейчас "
                                                f"'{passport.status.value}'.")
+            self._check_app_launch(passport)
             ruleset = self.storage.latest_ruleset()
             if ruleset is None:
                 raise ControlError("conflict", "Нет ни одного слоя: администратор должен создать слой.")

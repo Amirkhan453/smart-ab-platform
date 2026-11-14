@@ -70,6 +70,13 @@ def test_effect_only_after_exposure_and_truth(world, base):
         bgi = pos.loc[base.orders["unit_id"]].to_numpy()
         base_before = ~(treated[bgi] & (base.orders["day"].to_numpy() >= np.nan_to_num(exp_day[bgi], nan=np.inf)))
         assert base.orders.loc[base_before, "order_id"].isin(untouched.index).all()
+        # корректировки и ошибки оплаты нетронутых заказов — те же, что в мире без воздействия
+        mine = ev.adjustments[ev.adjustments["order_id"].isin(untouched.index)].reset_index(drop=True)
+        theirs = base.adjustments[base.adjustments["order_id"].isin(untouched.index)].reset_index(drop=True)
+        assert len(mine) > 1000 and mine.equals(theirs)
+        errs = lambda e: e.app_events[e.app_events["event_type"] == "payment_error"].set_index("event_id")["event_time"]
+        common = errs(ev).index.intersection(errs(base).index)
+        assert len(common) > 1000 and (errs(ev)[common] == errs(base)[common]).all()
         if lift > 0:
             added = ev.orders[~ev.orders["counterfactual"]]
             ga = pos.loc[added["unit_id"]].to_numpy()
@@ -100,7 +107,8 @@ def test_adjustments_and_app_events_are_consistent(base):
     orders = base.orders.set_index("order_id")
     adj = base.adjustments
     assert adj["order_id"].isin(orders.index).all() and adj["adjustment_id"].is_unique
-    joined = adj.join(orders[["order_time", "amount"]], on="order_id", rsuffix="_order")
+    joined = adj.merge(orders[["order_time", "amount"]].rename(columns={"amount": "amount_order"}),
+                       left_on="order_id", right_index=True)
     assert (joined["event_time"] > joined["order_time"]).all()
     refunds = joined[joined["kind"] == "refund"]
     assert (refunds["amount"] > 0).all() and (refunds["amount"] < refunds["amount_order"]).all()

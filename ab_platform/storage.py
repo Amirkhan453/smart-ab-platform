@@ -9,6 +9,7 @@ Storage — интерфейс. Реализации: MemoryStorage (тесты 
   и только по допустимым переходам;
 - версии ruleset только добавляются, строго по порядку (v, v+1, …);
 - аудит только дополняется; записи связаны хэш-цепочкой, verify_audit находит правку, вставку и удаление;
+- версии метрик только добавляются, по порядку (1, 2, …), и не меняются (MET-1);
 - transaction() — всё или ничего: смена статуса, новая версия ruleset и запись аудита сохраняются вместе.
 """
 import hashlib
@@ -20,6 +21,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterator, List, Optional, Protocol
 
+from ab_platform.metrics import MetricVersion
 from ab_platform.schemas.passport import ALLOWED_TRANSITIONS, ExperimentPassport
 from ab_platform.schemas.ruleset import Ruleset
 
@@ -97,6 +99,20 @@ class Storage(Protocol):
                      details: Optional[Dict[str, Any]] = None) -> AuditRecord: ...
     def audit(self, experiment_id: Optional[str] = None) -> List[AuditRecord]: ...
     def verify_audit(self) -> int: ...
+    def save_metric(self, metric: MetricVersion) -> None: ...
+    def get_metric(self, name: str, version: Optional[int] = None) -> Optional[MetricVersion]: ...
+    def list_metrics(self) -> List[MetricVersion]: ...
+
+
+def _check_metric_write(metric: MetricVersion, top: int, existing: Optional[MetricVersion]) -> bool:
+    """True — записать; False — такая версия уже есть с тем же содержимым. Иначе StorageError."""
+    if existing is not None:
+        if existing == metric:
+            return False
+        raise StorageError(f"Метрика {metric.ref} уже есть и неизменяема; изменения — новой версией.")
+    if metric.version != top + 1:
+        raise StorageError(f"Метрика '{metric.name}': ожидается версия {top + 1}, получена {metric.version}.")
+    return True
 
 
 def _now() -> str:
@@ -111,6 +127,7 @@ class MemoryStorage:
         self._passports: Dict[str, Dict[int, ExperimentPassport]] = {}
         self._rulesets: List[Ruleset] = []
         self._audit: List[AuditRecord] = []
+        self._metrics: Dict[str, Dict[int, MetricVersion]] = {}
         self._depth = 0
 
     @contextmanager
@@ -118,12 +135,13 @@ class MemoryStorage:
         with self._lock:
             if self._depth:
                 raise StorageError("Вложенные транзакции не поддерживаются.")
-            snapshot = ({k: dict(v) for k, v in self._passports.items()}, list(self._rulesets), list(self._audit))
+            snapshot = ({k: dict(v) for k, v in self._passports.items()}, list(self._rulesets), list(self._audit),
+                        {k: dict(v) for k, v in self._metrics.items()})
             self._depth = 1
             try:
                 yield
             except BaseException:
-                self._passports, self._rulesets, self._audit = snapshot
+                self._passports, self._rulesets, self._audit, self._metrics = snapshot
                 raise
             finally:
                 self._depth = 0
@@ -181,6 +199,21 @@ class MemoryStorage:
             _verify_chain(self._audit)
             return len(self._audit)
 
+    def save_metric(self, metric: MetricVersion) -> None:
+        with self._lock:
+            versions = self._metrics.setdefault(metric.name, {})
+            if _check_metric_write(metric, max(versions, default=0), versions.get(metric.version)):
+                versions[metric.version] = metric
+
+    def get_metric(self, name: str, version: Optional[int] = None) -> Optional[MetricVersion]:
+        with self._lock:
+            versions = self._metrics.get(name) or {}
+            return versions.get(max(versions) if version is None and versions else version)
+
+    def list_metrics(self) -> List[MetricVersion]:
+        with self._lock:
+            return [m for _, v in sorted(self._metrics.items()) for _, m in sorted(v.items())]
+
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -198,6 +231,13 @@ CREATE TABLE IF NOT EXISTS rulesets (
     etag       TEXT NOT NULL,
     body       TEXT NOT NULL,
     created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS metrics (
+    name       TEXT NOT NULL,
+    version    INTEGER NOT NULL,
+    body       TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (name, version)
 );
 CREATE TABLE IF NOT EXISTS audit (
     seq           INTEGER PRIMARY KEY,
@@ -353,3 +393,26 @@ class SqliteStorage:
         records = self._audit_rows()
         _verify_chain(records)
         return len(records)
+
+    def save_metric(self, metric: MetricVersion) -> None:
+        with self._write():
+            top = self._conn.execute("SELECT COALESCE(MAX(version), 0) FROM metrics WHERE name = ?",
+                                     (metric.name,)).fetchone()[0]
+            if _check_metric_write(metric, top, self.get_metric(metric.name, metric.version)):
+                self._conn.execute("INSERT INTO metrics (name, version, body, created_at) VALUES (?, ?, ?, ?)",
+                                   (metric.name, metric.version, metric.model_dump_json(), _now()))
+
+    def get_metric(self, name: str, version: Optional[int] = None) -> Optional[MetricVersion]:
+        with self._lock:
+            if version is None:
+                row = self._conn.execute("SELECT body FROM metrics WHERE name = ? ORDER BY version DESC LIMIT 1",
+                                         (name,)).fetchone()
+            else:
+                row = self._conn.execute("SELECT body FROM metrics WHERE name = ? AND version = ?",
+                                         (name, version)).fetchone()
+        return MetricVersion.model_validate_json(row[0]) if row else None
+
+    def list_metrics(self) -> List[MetricVersion]:
+        with self._lock:
+            rows = self._conn.execute("SELECT body FROM metrics ORDER BY name, version").fetchall()
+        return [MetricVersion.model_validate_json(r[0]) for r in rows]

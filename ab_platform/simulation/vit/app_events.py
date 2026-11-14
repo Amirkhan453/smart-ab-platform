@@ -125,7 +125,18 @@ class AppWorld:
         i_tst, d_tst = _uniform_points(rng_cf, rng_cf.poisson(lam * m_test * (total - pre)), pre_end, ends)
         idx = np.concatenate([i_pre, i_tst])
         day = np.concatenate([d_pre, d_tst])
-        noise_cf = np.exp(rng_cf.normal(0.0, gp.order_noise_sd, len(idx)) - gp.order_noise_sd ** 2 / 2)
+        # у каждого заказа свои скидка, отмена или возврат, ошибки оплаты: разыгрываются вместе с заказом,
+        # поэтому контрфактический заказ одинаков (вместе с корректировками) в любой реализации
+        def order_traits(r, k):
+            return {
+                "noise": np.exp(r.normal(0.0, gp.order_noise_sd, k) - gp.order_noise_sd ** 2 / 2),
+                "disc": np.clip(r.normal(p.discount_rate_mean, 0.03, k), 0.0, 0.5),
+                "u": r.random(k), "share": r.uniform(p.refund_share_min, p.refund_share_max, k),
+                "delay_cancel": r.uniform(300, 7200, k), "delay_refund": r.uniform(DAY, 3 * DAY, k),
+                "n_err": r.poisson(p.payment_error_per_order, k),
+            }
+        cf = order_traits(rng_cf, len(idx))
+        cf_amt = np.round(check[idx] * cf["noise"], 2)
         keep = np.ones(len(idx), dtype=bool)
         if lift < 0:  # прореживание заказов после показа у тестовой группы
             after = active[idx] & (day >= t_exp[idx])
@@ -134,64 +145,68 @@ class AppWorld:
         if lift > 0:
             i_add, d_add = _uniform_points(rng, rng.poisson(lam * m_test * lift * np.maximum(total - t_exp, 0.0)),
                                            t_exp, ends)
-        noise_add = np.exp(rng.normal(0.0, gp.order_noise_sd, len(i_add)) - gp.order_noise_sd ** 2 / 2)
-        cf_amt = np.round(check[idx] * noise_cf, 2)
+        ad = order_traits(rng, len(i_add))
+        traits = {k: np.concatenate([cf[k][keep], ad[k]]) for k in cf}
         o_idx = np.concatenate([idx[keep], i_add])
         o_day = np.concatenate([day[keep], d_add])
-        o_amt = np.concatenate([cf_amt[keep], np.round(check[i_add] * noise_add, 2)])
+        o_amt = np.concatenate([cf_amt[keep], np.round(check[i_add] * ad["noise"], 2)])
         o_cf = np.concatenate([np.ones(keep.sum(), dtype=bool), np.zeros(len(i_add), dtype=bool)])
         # номер заказа устойчив: контрфактический заказ сохраняет id в любой реализации, добавленные — свои id
         cf_no = np.arange(len(idx))
-        ids = [f"{self.prefix}o{k}" for k in cf_no[keep]] + [f"{self.prefix}x{k}" for k in range(len(i_add))]
-        disc = np.round(o_amt * np.clip(rng.normal(p.discount_rate_mean, 0.03, len(o_idx)), 0.0, 0.5), 2)
+        ids = np.array([f"{self.prefix}o{k}" for k in cf_no[keep]] + [f"{self.prefix}x{k}" for k in range(len(i_add))],
+                       dtype=object)
+        order_time = _times(self.start, o_day)
         orders = pd.DataFrame({
-            "order_id": ids, "unit_id": g["unit_id"].to_numpy()[o_idx],
-            "unit_type": "guest_id", "order_time": _times(self.start, o_day), "amount": o_amt, "discount": disc,
+            "order_id": ids, "unit_id": g["unit_id"].to_numpy()[o_idx], "unit_type": "guest_id",
+            "order_time": order_time, "amount": o_amt, "discount": np.round(o_amt * traits["disc"], 2),
             "day": o_day, "counterfactual": o_cf,
-        }).sort_values(["order_time", "order_id"], kind="stable").reset_index(drop=True)
+        })
 
         # отмены и возвраты — по исходному заказу, приходят позже
-        u = rng.random(len(orders))
+        u = traits["u"]
         cancel, refund = u < p.p_cancel, (u >= p.p_cancel) & (u < p.p_cancel + p.p_refund)
-        share = rng.uniform(p.refund_share_min, p.refund_share_max, len(orders))
-        delay = np.where(cancel, rng.uniform(300, 7200, len(orders)), rng.uniform(DAY, 3 * DAY, len(orders)))
-        adj = orders.loc[cancel | refund, ["order_id", "order_time", "amount"]].copy()
-        adj["kind"] = np.where(cancel[cancel | refund], "cancel", "refund")
-        adj["amount"] = np.where(adj["kind"] == "refund", np.maximum(np.round(adj["amount"] * share[cancel | refund], 2), 0.01),
-                                 np.nan)
-        adj["event_time"] = adj["order_time"] + pd.to_timedelta(np.round(delay[cancel | refund] * 1e6).astype("int64"),
-                                                                unit="us")
-        adj["adjustment_id"] = [f"{self.prefix}a{k}" for k in range(len(adj))]
-        adjustments = adj[["adjustment_id", "order_id", "kind", "amount", "event_time"]].reset_index(drop=True)
+        sel = cancel | refund
+        delay = np.where(cancel, traits["delay_cancel"], traits["delay_refund"])[sel]
+        adjustments = pd.DataFrame({
+            "adjustment_id": [f"{o}-adj" for o in ids[sel]], "order_id": ids[sel],
+            "kind": np.where(cancel[sel], "cancel", "refund"),
+            "amount": np.where(refund[sel], np.maximum(np.round(o_amt[sel] * traits["share"][sel], 2), 0.01), np.nan),
+            "event_time": order_time[sel].reset_index(drop=True)
+            + pd.to_timedelta(np.round(delay * 1e6).astype("int64"), unit="us"),
+        })
 
-        # события приложения: падения на заходах, ошибки оплаты на заказах
-        visits = g["visit_rate"].to_numpy()
-        crash_rate = visits * p.crash_per_visit
-        c_idx, c_day = _uniform_points(rng, rng.poisson(crash_rate * total), zeros, ends)
-        c_add_idx, c_add_day = (np.array([], dtype=int), np.array([]))
-        if crash_lift > 0:
-            c_add_idx, c_add_day = _uniform_points(
-                rng, rng.poisson(crash_rate * crash_lift * np.maximum(total - t_exp, 0.0)), t_exp, ends)
-        elif crash_lift < 0:
+        # события приложения: падения на заходах (контрфакт — из rng_cf), ошибки оплаты и попытки — у заказа
+        crash_rate = g["visit_rate"].to_numpy() * p.crash_per_visit
+        c_idx, c_day = _uniform_points(rng_cf, rng_cf.poisson(crash_rate * total), zeros, ends)
+        c_ids = np.array([f"{self.prefix}c{k}" for k in range(len(c_idx))], dtype=object)
+        if crash_lift < 0:
             keep_c = ~(active[c_idx] & (c_day >= t_exp[c_idx]) & (rng.random(len(c_idx)) < -crash_lift))
-            c_idx, c_day = c_idx[keep_c], c_day[keep_c]
-        crash_idx, crash_day = np.concatenate([c_idx, c_add_idx]), np.concatenate([c_day, c_add_day])
-        n_err = rng.poisson(p.payment_error_per_order, len(orders))
+            c_idx, c_day, c_ids = c_idx[keep_c], c_day[keep_c], c_ids[keep_c]
+        if crash_lift > 0:
+            a_idx, a_day = _uniform_points(rng, rng.poisson(crash_rate * crash_lift * np.maximum(total - t_exp, 0.0)),
+                                           t_exp, ends)
+            c_idx, c_day = np.concatenate([c_idx, a_idx]), np.concatenate([c_day, a_day])
+            c_ids = np.concatenate([c_ids, np.array([f"{self.prefix}cx{k}" for k in range(len(a_idx))], dtype=object)])
+        n_err = traits["n_err"]
         err_rows = np.repeat(np.arange(len(orders)), n_err)
-        err_time = orders["order_time"].iloc[err_rows].reset_index(drop=True) - pd.to_timedelta(
-            np.round(rng.uniform(5, 600, len(err_rows)) * 1e6).astype("int64"), unit="us")
+        err_no = np.concatenate([np.arange(k) for k in n_err]) if len(n_err) else np.array([], dtype=int)
+        # ошибка оплаты — за (k + 1) минут до заказа: время тоже привязано к заказу
+        err_time = order_time.iloc[err_rows].reset_index(drop=True) - pd.to_timedelta((err_no + 1) * 60, unit="s")
         unit_of = g["unit_id"].to_numpy()
         app = pd.concat([
-            pd.DataFrame({"unit_id": unit_of[crash_idx], "event_type": "app_crash",
-                          "event_time": _times(self.start, crash_day)}),
-            pd.DataFrame({"unit_id": orders["unit_id"].to_numpy()[err_rows], "event_type": "payment_error",
+            pd.DataFrame({"event_id": c_ids, "unit_id": unit_of[c_idx], "event_type": "app_crash",
+                          "event_time": _times(self.start, c_day)}),
+            pd.DataFrame({"event_id": [f"{o}-err{k}" for o, k in zip(ids[err_rows], err_no)],
+                          "unit_id": orders["unit_id"].to_numpy()[err_rows], "event_type": "payment_error",
                           "event_time": err_time}),
-            pd.DataFrame({"unit_id": orders["unit_id"], "event_type": "payment_attempt",
-                          "event_time": orders["order_time"]}),
-        ], ignore_index=True).sort_values(["event_time", "unit_id"], kind="stable").reset_index(drop=True)
+            pd.DataFrame({"event_id": [f"{o}-pay" for o in ids], "unit_id": orders["unit_id"],
+                          "event_type": "payment_attempt", "event_time": order_time}),
+        ], ignore_index=True)
         app["unit_type"] = "guest_id"
-        app["event_id"] = [f"{self.prefix}e{k}" for k in range(len(app))]
         app = app[["event_id", "unit_id", "unit_type", "event_type", "event_time"]]
+        orders = orders.sort_values(["order_time", "order_id"], kind="stable").reset_index(drop=True)
+        adjustments = adjustments.sort_values(["event_time", "adjustment_id"], kind="stable").reset_index(drop=True)
+        app = app.sort_values(["event_time", "event_id"], kind="stable").reset_index(drop=True)
 
         truth = self._truth(orders, idx, day, cf_amt, active, t_exp, lift, crash_lift, window_days)
         return AppEvents(orders=orders, adjustments=adjustments, app_events=app, truth=truth)

@@ -131,6 +131,8 @@ MIN_CLUSTERS_PER_ARM_ASYMPTOTIC = 50
 MIN_PAIRS = 6
 FORBIDDEN_LEVERS_MVP = frozenset({"price", "цена"})
 MAX_VARIANT_PARAMS_BYTES = 8192
+# защитные метрики приложения по умолчанию (ТЗ v4.1, MET-2) — имена в реестре метрик (ab_platform/metrics.py)
+APP_GUARDRAIL_NAMES = ("crash_share", "payment_error_share", "cancel_rate")
 
 
 class PassportStatus(str, Enum):
@@ -170,6 +172,10 @@ class MetricDefinition(BaseModel):
     expected_direction: Direction = Direction.INCREASE
     winsorize_percentile: Optional[float] = Field(
         0.995, ge=0.90, le=1.0, description="Порог винзоризации выбросов (например, 0.995)"
+    )
+    registry_ref: Optional[str] = Field(
+        None, pattern=r"^[a-z][a-z0-9_]{1,62}@[1-9][0-9]{0,5}$",
+        description="Версия метрики в реестре (имя@версия); правка метрики не меняет отчёты по прежней версии",
     )
 
     @model_validator(mode="after")
@@ -545,6 +551,12 @@ class ExperimentPassport(BaseModel):
         """Оговорки дизайна, которые не блокируют Паспорт, но обязаны попасть в форму и отчёт (TGT-3, IDN-1)."""
         out = [f"Таргетинг по признаку, на который может влиять тест, — {w}. Анализ только по первому показу."
                for w in self.targeting.treatment_sensitive]
+        if self.domain == Domain.GUEST:
+            present = {(g.metric.registry_ref or "").split("@")[0] for g in self.guardrail_metrics}
+            missing = [n for n in APP_GUARDRAIL_NAMES if n not in present]
+            if missing:
+                out.append(f"Нет защитных метрик приложения {missing} (ТЗ v4.1, MET-2): падение приложения или "
+                           "оплаты в варианте не будет замечено.")
         if self.randomization_unit == RandomizationUnit.DEVICE_ID:
             out.append(
                 "Единица — устройство, а не гость: один гость на двух устройствах может увидеть оба варианта, "

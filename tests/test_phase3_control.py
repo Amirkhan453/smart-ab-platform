@@ -5,6 +5,7 @@ from contextlib import contextmanager
 
 import pytest
 
+from ab_platform.metrics import APP_GUARDRAILS, DEFAULT_METRICS
 from ab_platform.control import Actor, ControlError, ExperimentService, rule_from_passport, verify_ruleset
 from ab_platform.engine.ruleset_engine import evaluate
 from ab_platform.schemas.passport import ExperimentPassport, PassportStatus
@@ -23,18 +24,29 @@ IOS = {"platform": "ios", "app_version": "5.4"}
 def svc(request, tmp_path):
     storage = MemoryStorage() if request.param == "memory" else SqliteStorage(str(tmp_path / "ab.db"))
     service = ExperimentService(storage, intersection_matrix={"exp_push": ["exp_coupon"]})
+    service.ensure_default_metrics()
     service.add_layer(ADMIN, "ui")
     yield service
     if request.param == "sqlite":
         storage.close()
 
 
+def app_metrics():
+    """Метрики Паспорта приложения из реестра (фаза 4): выручка на гостя и защитные метрики приложения."""
+    reg = {m.name: m for m in DEFAULT_METRICS}
+    return dict(primary_metric=reg["revenue_per_guest"].definition().model_dump(), estimand="triggered",
+                guardrail_metrics=[{"metric": reg[n].definition().model_dump(), "max_allowed_degradation_rel": 0.1,
+                                    "tradeoff_rationale": "защитная метрика приложения"} for n in APP_GUARDRAILS])
+
+
 def draft(exp="exp_menu", **kw):
     data = base(experiment_id=exp, test_key=f"flag_{exp}", layer_id="ui", variants=V2, ramp_plan=[10, 50, 100],
-                targeting={"platforms": ["ios"], "app_version_min": "5.2"}, targeting_audience_share=0.4)
+                targeting={"platforms": ["ios"], "app_version_min": "5.2"}, targeting_audience_share=0.4,
+                **app_metrics())
     data.update(kw)
     return {k: (v.model_dump() if hasattr(v, "model_dump") else v) for k, v in data.items()} | {
-        "variants": data["variants"], "guardrail_metrics": [g.model_dump() for g in data["guardrail_metrics"]]}
+        "variants": data["variants"],
+        "guardrail_metrics": [g if isinstance(g, dict) else g.model_dump() for g in data["guardrail_metrics"]]}
 
 
 def approved(svc, exp="exp_menu", **kw):
@@ -353,7 +365,8 @@ def test_every_command_is_audited_and_chain_is_valid(svc):
     assert log[4].details == {"version": 1, "from": "approved", "to": "running", "ruleset_version": 2, "ramp_pct": 10.0,
                               "rule": "exp_menu@v1"}
     assert log[5].details["from"] == 10.0 and log[5].details["to"] == 50 and log[5].details["ruleset_version"] == 3
-    assert svc.storage.audit()[0].action == "layer.add" and svc.storage.verify_audit() == len(svc.storage.audit())
+    first = [r.action for r in svc.storage.audit() if r.experiment_id is None]
+    assert first[:8] == ["metric.seed"] * 7 + ["layer.add"] and svc.storage.verify_audit() == len(svc.storage.audit())
     # версии ruleset в аудите совпадают с сохранёнными
     assert [r.details["ruleset_version"] for r in log[4:]] == [2, 3, 4, 5, 6] and svc.ruleset().version == 6
 

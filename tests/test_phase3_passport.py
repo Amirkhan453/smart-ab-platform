@@ -9,6 +9,11 @@ from tests.test_phase1_passport_v4 import base
 TGT = {"platforms": ["ios"], "app_version_min": "5.2"}
 
 
+def not_met2(warnings):
+    """Предупреждения дизайна без MET-2 (защитные метрики приложения — проверяются в tests/test_phase4_metrics.py)."""
+    return [w for w in warnings if "MET-2" not in w]
+
+
 # ---------------- правила сравнения (TGT-4) ----------------
 @pytest.mark.parametrize("text, expected", [
     ("5", (5,)), ("5.0", (5,)), ("5.1.0", (5, 1)), ("5.10", (5, 10)), ("05.01", (5, 1)), ("0", (0,)), ("0.0", (0,)),
@@ -87,9 +92,10 @@ def test_targeting_requires_audience_share_and_scales_traffic():
         ExperimentPassport(**base(targeting_audience_share=0.5))
     p = ExperimentPassport(**base(targeting=TGT, targeting_audience_share=0.35))
     assert p.target_daily_units == 3500 and ExperimentPassport(**base()).target_daily_units == 10_000
-    assert p.design_warnings == []
+    assert not_met2(p.design_warnings) == []
     risky = ExperimentPassport(**base(targeting={"app_version_max": "5.9"}, targeting_audience_share=0.5))
-    assert len(risky.design_warnings) == 1 and "первому показу" in risky.design_warnings[0]
+    warnings = not_met2(risky.design_warnings)
+    assert len(warnings) == 1 and "первому показу" in warnings[0]
 
 
 def test_targeting_only_for_guest_units():
@@ -116,7 +122,7 @@ def test_idn1_pre_login_requires_device_unit():
         ExperimentPassport(**base(exposure_surface="pre_login"))
     p = ExperimentPassport(**base(exposure_surface="pre_login", randomization_unit=RandomizationUnit.DEVICE_ID))
     assert any("устройство" in w for w in p.design_warnings)
-    assert ExperimentPassport(**base()).design_warnings == []
+    assert not_met2(ExperimentPassport(**base()).design_warnings) == []
     with pytest.raises(ValidationError):
         ExperimentPassport(**base(exposure_surface="kiosk"))
 

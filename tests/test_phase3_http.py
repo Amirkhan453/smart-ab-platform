@@ -41,6 +41,7 @@ def h(name):
 
 def make_app(storage=None, exposures=None):
     service = ExperimentService(storage or MemoryStorage())
+    service.ensure_default_metrics()
     return create_app(exposure_store=exposures, service=service, auth=Auth.parse(SPEC)), service
 
 
@@ -200,7 +201,7 @@ def test_no_route_publishes_a_ruleset():
     app, _ = make_app()
     writes = {(m, r.path) for r in app.routes for m in getattr(r, "methods", ()) if m in ("POST", "PUT", "PATCH", "DELETE")}
     assert writes == {("POST", "/decide"), ("POST", "/exposures"), ("POST", "/passports"), ("POST", "/orders"),
-                      ("POST", "/order-adjustments"), ("POST", "/app-events"),
+                      ("POST", "/order-adjustments"), ("POST", "/app-events"), ("POST", "/metrics"),
                       ("POST", "/passports/{experiment_id}/versions"), ("POST", "/passports/{experiment_id}/{action}"),
                       ("POST", "/layers"), ("PUT", "/holdout")}
     http = TestClient(app)
