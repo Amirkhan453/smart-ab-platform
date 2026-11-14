@@ -23,6 +23,19 @@ def _utc(values) -> pd.Series:
     return pd.to_datetime(pd.Series(values, dtype="object"), utc=True, format="ISO8601")
 
 
+def _prepare_orders(orders: pd.DataFrame, adj: pd.DataFrame) -> pd.DataFrame:
+    """Заказ с учётом корректировок: отменён ли, выручка за вычетом возвратов (по исходному заказу)."""
+    cancelled = set(adj.loc[adj["kind"] == "cancel", "order_id"])
+    refunds = adj[adj["kind"] == "refund"].groupby("order_id")["amount"].sum()
+    orders = orders.copy()
+    orders["order_time"] = _utc(orders["order_time"])
+    orders["cancelled"] = orders["order_id"].isin(cancelled)
+    orders["valid"] = ~orders["cancelled"]
+    refund = orders["order_id"].map(refunds).fillna(0.0)
+    orders["net"] = np.where(orders["cancelled"], 0.0, np.maximum(orders["amount"] - refund, 0.0))
+    return orders
+
+
 def _period_aggregates(orders: pd.DataFrame, apps: pd.DataFrame, units: pd.Index, lo: pd.Series,
                        hi: pd.Series) -> pd.DataFrame:
     """Агрегаты гостя за [lo, hi): заказы всего, неотменённые, отменённые, выручка; события приложения."""
@@ -87,15 +100,8 @@ def build_unit_table(
     units = pop.index
 
     orders = store.frame("orders", upto_seq)
-    orders = orders[orders["unit_id"].isin(units) & (orders["unit_type"] == unit_type)].copy()
-    orders["order_time"] = _utc(orders["order_time"])
-    adj = store.frame("adjustments", upto_seq)
-    cancelled = set(adj.loc[adj["kind"] == "cancel", "order_id"])
-    refunds = adj[adj["kind"] == "refund"].groupby("order_id")["amount"].sum()
-    orders["cancelled"] = orders["order_id"].isin(cancelled)
-    orders["valid"] = ~orders["cancelled"]
-    refund = orders["order_id"].map(refunds).fillna(0.0)
-    orders["net"] = np.where(orders["cancelled"], 0.0, np.maximum(orders["amount"] - refund, 0.0))
+    orders = _prepare_orders(orders[orders["unit_id"].isin(units) & (orders["unit_type"] == unit_type)],
+                             store.frame("adjustments", upto_seq))
     apps = store.frame("app_events", upto_seq)
     apps = apps[apps["unit_id"].isin(units) & (apps["unit_type"] == unit_type)].copy()
     apps["event_time"] = _utc(apps["event_time"])
@@ -108,6 +114,49 @@ def build_unit_table(
     table = pop.drop(columns=["t0"]).copy()
     table["window_end"] = window_end.map(lambda t: t.isoformat(timespec="microseconds"))
     table["window_complete"] = (t0 + timedelta(days=window_days)) <= cut
+    for m in metrics:
+        num_col, den_col = m.columns()
+        num, den = _metric_values(win, m)
+        table[num_col] = num
+        if den_col is not None:
+            table[den_col] = den
+        else:
+            table[f"{m.name}__pre"] = _metric_values(pre, m)[0]
+    return table.reset_index()
+
+
+def build_history_table(
+    store,
+    metrics: Sequence[MetricVersion],
+    start: datetime,
+    split: datetime,
+    end: datetime,
+    unit_type: str = "guest_id",
+    upto_seq: Optional[int] = None,
+) -> pd.DataFrame:
+    """
+    История до запуска для предстартовой проверки: гости с заказом или событием приложения в [start, end).
+    Метрики — за [split, end) (как будто это окно теста), ковариата <имя>__pre — за [start, split).
+    """
+    if not (start < split < end) or any(t.tzinfo is None for t in (start, split, end)):
+        raise ValueError("Нужно start < split < end, время с часовым поясом.")
+    lo_all, mid, hi_all = (pd.Timestamp(t).tz_convert("UTC") for t in (start, split, end))
+    orders = store.frame("orders", upto_seq)
+    orders = _prepare_orders(orders[orders["unit_type"] == unit_type], store.frame("adjustments", upto_seq))
+    apps = store.frame("app_events", upto_seq)
+    apps = apps[apps["unit_type"] == unit_type].copy()
+    apps["event_time"] = _utc(apps["event_time"])
+    active = set(orders.loc[(orders["order_time"] >= lo_all) & (orders["order_time"] < hi_all), "unit_id"]) | set(
+        apps.loc[(apps["event_time"] >= lo_all) & (apps["event_time"] < hi_all), "unit_id"])
+    units = pd.Index(sorted(active), name="unit_id")
+    orders = orders[orders["unit_id"].isin(units)]
+    apps = apps[apps["unit_id"].isin(units)]
+
+    def const(t):
+        return pd.Series(t, index=units)
+    win = _period_aggregates(orders, apps, units, const(mid), const(hi_all))
+    pre = _period_aggregates(orders, apps, units, const(lo_all), const(mid))
+    table = pd.DataFrame(index=units)
     for m in metrics:
         num_col, den_col = m.columns()
         num, den = _metric_values(win, m)

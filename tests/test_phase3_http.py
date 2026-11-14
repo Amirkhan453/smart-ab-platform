@@ -40,7 +40,8 @@ def h(name):
 
 
 def make_app(storage=None, exposures=None):
-    service = ExperimentService(storage or MemoryStorage())
+    # предстартовая проверка (фаза 4) требует истории заказов; HTTP фазы 3 проверяется без неё
+    service = ExperimentService(storage or MemoryStorage(), require_preflight=False)
     service.ensure_default_metrics()
     return create_app(exposure_store=exposures, service=service, auth=Auth.parse(SPEC)), service
 
@@ -203,7 +204,10 @@ def test_no_route_publishes_a_ruleset():
     assert writes == {("POST", "/decide"), ("POST", "/exposures"), ("POST", "/passports"), ("POST", "/orders"),
                       ("POST", "/order-adjustments"), ("POST", "/app-events"), ("POST", "/metrics"),
                       ("POST", "/passports/{experiment_id}/versions"), ("POST", "/passports/{experiment_id}/{action}"),
-                      ("POST", "/layers"), ("PUT", "/holdout")}
+                      ("POST", "/layers"), ("PUT", "/holdout"),
+                      # фаза 4: запуски анализа и расписание — ruleset не пишут, пауза только через жизненный цикл
+                      ("POST", "/analysis-runs"), ("POST", "/analysis-runs/{run_id}/reproduce"),
+                      ("POST", "/scheduler/run")}
     http = TestClient(app)
     for method in ("post", "put", "patch", "delete"):
         assert http.request(method, "/ruleset", json={}, headers=h("root")).status_code == 405
@@ -408,6 +412,7 @@ def test_restart_keeps_passports_rulesets_and_audit(tmp_path, monkeypatch):
     db, jsonl = str(tmp_path / "ab.db"), str(tmp_path / "events.db")
     monkeypatch.setenv("ABP_DB_PATH", db)
     monkeypatch.setenv("ABP_API_KEYS", SPEC)
+    monkeypatch.setenv("ABP_PREFLIGHT_DISABLED", "1")  # стенд без истории заказов
     monkeypatch.setenv("ABP_EVENTS_DB_PATH", jsonl)
     first = create_app_from_env()
     http = TestClient(first)
@@ -452,6 +457,7 @@ def test_server_refuses_to_start_on_tampered_database(tmp_path, monkeypatch, sql
     monkeypatch.setenv("ABP_DB_PATH", db)
     monkeypatch.setenv("ABP_EVENTS_DB_PATH", str(tmp_path / "events.db"))
     monkeypatch.setenv("ABP_API_KEYS", SPEC)
+    monkeypatch.setenv("ABP_PREFLIGHT_DISABLED", "1")  # стенд без истории заказов
     app = create_app_from_env()
     running(TestClient(app))
     app.state.service.storage.close()

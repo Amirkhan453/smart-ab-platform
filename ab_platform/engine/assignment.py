@@ -86,6 +86,53 @@ def smhasher_self_test() -> int:
     return murmurhash3_x86_32(hashes, seed=0)
 
 
+def _rotl_vec(x: np.ndarray, r: int) -> np.ndarray:
+    return ((x << np.uint64(r)) | (x >> np.uint64(32 - r))) & np.uint64(MASK32)
+
+
+def murmurhash3_x86_32_many(keys: Sequence[bytes]) -> np.ndarray:
+    """
+    Тот же MurmurHash3 x86_32 (seed 0) для многих ключей сразу, на numpy: ключи группируются по длине, блоки
+    обрабатываются столбцами. Нужен там, где хэшей миллионы: A/A и предстартовая проверка (500 солей × все гости).
+    Совпадение со скалярной версией и C-эталоном проверяют тесты.
+    """
+    out = np.empty(len(keys), dtype=np.uint64)
+    if not keys:
+        return out.astype(np.uint32)
+    lengths = np.fromiter((len(k) for k in keys), dtype=np.int64, count=len(keys))
+    m32, c1, c2 = np.uint64(MASK32), np.uint64(0xCC9E2D51), np.uint64(0x1B873593)
+    for length in np.unique(lengths):
+        idx = np.flatnonzero(lengths == length)
+        raw = np.frombuffer(b"".join(keys[i] for i in idx), dtype=np.uint8).reshape(len(idx), int(length))
+        h = np.zeros(len(idx), dtype=np.uint64)
+        nblocks = int(length) // 4
+        if nblocks:
+            blocks = raw[:, :nblocks * 4].astype(np.uint64).reshape(len(idx), nblocks, 4)
+            words = blocks[:, :, 0] | (blocks[:, :, 1] << np.uint64(8)) | (blocks[:, :, 2] << np.uint64(16)) | (
+                blocks[:, :, 3] << np.uint64(24))
+            for b in range(nblocks):
+                k = (words[:, b] * c1) & m32
+                k = (_rotl_vec(k, 15) * c2) & m32
+                h = _rotl_vec(h ^ k, 13)
+                h = (h * np.uint64(5) + np.uint64(0xE6546B64)) & m32
+        rest = int(length) & 3
+        if rest:
+            tail = raw[:, nblocks * 4:].astype(np.uint64)
+            k = np.zeros(len(idx), dtype=np.uint64)
+            for j in range(rest - 1, -1, -1):
+                k ^= tail[:, j] << np.uint64(8 * j)
+            k = (_rotl_vec((k * c1) & m32, 15) * c2) & m32
+            h ^= k
+        h ^= np.uint64(length)
+        h ^= h >> np.uint64(16)
+        h = (h * np.uint64(0x85EBCA6B)) & m32
+        h ^= h >> np.uint64(13)
+        h = (h * np.uint64(0xC2B2AE35)) & m32
+        h ^= h >> np.uint64(16)
+        out[idx] = h
+    return out.astype(np.uint32)
+
+
 def bucket(salt: str, unit_id: str) -> int:
     """Бакет [0, 10000) по ТЗ 4.1: murmur3("{salt}:{unit_id}", seed 0) mod 10000."""
     if not unit_id or not isinstance(unit_id, str):
@@ -136,8 +183,17 @@ class DeterministicAssignmentEngine:
 
     @classmethod
     def buckets_for(cls, salt_key: str, unit_ids) -> np.ndarray:
-        """Бакеты варианта (шаг 2) для набора единиц тем же хэшем, что и assign_user — для A/A на боевом пути."""
-        return np.fromiter((bucket(salt_key, str(u)) for u in unit_ids), dtype=np.int64)
+        """
+        Бакеты варианта (шаг 2) для набора единиц тем же хэшем, что и assign_user — для A/A на боевом пути.
+        Считается векторно (murmurhash3_x86_32_many); пустые идентификаторы отклоняются, как в bucket.
+        """
+        if not salt_key or not isinstance(salt_key, str):
+            raise ValueError("salt должен быть непустой строкой.")
+        ids = [str(u) for u in unit_ids]
+        if any(not u for u in ids):
+            raise ValueError("unit_id должен быть непустой строкой.")
+        keys = [f"{salt_key}:{u}".encode("utf-8") for u in ids]
+        return (murmurhash3_x86_32_many(keys) % np.uint32(N_BUCKETS)).astype(np.int64)
 
     @staticmethod
     def control_from_bucket(z, control_split_pct: float):

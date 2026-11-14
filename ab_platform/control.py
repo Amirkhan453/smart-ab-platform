@@ -12,7 +12,8 @@
 """
 from dataclasses import dataclass
 import threading
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from datetime import datetime, timezone
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from ab_platform.engine.ruleset_engine import launch, update_rule
 from ab_platform.metrics import DEFAULT_METRICS, SYSTEM_OWNER, MetricVersion, parse_ref
@@ -120,8 +121,16 @@ class ExperimentService:
     """Команды жизненного цикла. intersection_matrix — запреты одновременного запуска по experiment_id Паспортов."""
 
     def __init__(self, storage: Storage, intersection_matrix: Optional[Dict[str, Sequence[str]]] = None,
-                 default_holdout_pct: float = 5.0):
+                 default_holdout_pct: float = 5.0, require_preflight: bool = True,
+                 clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)):
+        """
+        require_preflight — запуск только после пройденной предстартовой проверки (A/A и баланс, фаза 4).
+        clock — время команд: оно пишется в аудит (поле at) и задаёт начало и конец теста для анализа.
+        В симуляциях время синтетическое, поэтому часы подставляются.
+        """
         self.storage = storage
+        self.require_preflight = require_preflight
+        self.clock = clock
         self._matrix = {k: list(v) for k, v in (intersection_matrix or {}).items()}
         self._default_holdout_pct = default_holdout_pct
         self._cache_lock = threading.Lock()
@@ -277,6 +286,18 @@ class ExperimentService:
         if problems:
             raise ControlError("invalid", "Метрики Паспорта: " + "; ".join(problems) + ".")
 
+    def _check_preflight(self, passport: ExperimentPassport) -> None:
+        """Последняя предстартовая проверка этой версии Паспорта (по хэшу) пройдена (фаза 4, решение 6)."""
+        runs = [r for r in self.storage.list_analysis_runs(passport.experiment_id, "preflight")
+                if r.inputs.passport_hash == passport.passport_hash]
+        if not runs:
+            raise ControlError("conflict", "Нет предстартовой проверки этой версии Паспорта (A/A на истории и баланс): "
+                                           "запустите её перед стартом.")
+        last = runs[-1]
+        if not last.result.get("passed"):
+            raise ControlError("conflict", f"Предстартовая проверка {last.run_id} не пройдена: "
+                                           f"{'; '.join(last.result.get('problems', []))}.")
+
     # ---------------- Паспорт до утверждения ----------------
     def save_draft(self, actor: Actor, data: Dict[str, Any]) -> ExperimentPassport:
         """
@@ -335,8 +356,20 @@ class ExperimentService:
         self.storage.save_passport(new)
         self.storage.append_audit(actor.subject, action, passport.experiment_id,
                                   {"version": passport.version, "from": passport.status.value, "to": to.value,
-                                   **(details or {})})
+                                   "at": self.clock().astimezone(timezone.utc).isoformat(), **(details or {})})
         return new
+
+    def lifecycle_times(self, experiment_id: str, version: int) -> Dict[str, Optional[str]]:
+        """Время запуска и остановки версии теста по аудиту (поле at): начало и конец теста для анализа."""
+        started = stopped = None
+        for r in self.storage.audit(experiment_id):
+            if r.details.get("version") != version:
+                continue
+            if r.action == "experiment.start" and started is None:
+                started = r.details.get("at")
+            if r.action == "experiment.stop":
+                stopped = r.details.get("at")
+        return {"started_at": started, "stopped_at": stopped}
 
     def submit(self, actor: Actor, experiment_id: str) -> ExperimentPassport:
         with self.storage.transaction():
@@ -385,6 +418,8 @@ class ExperimentService:
                 raise ControlError("conflict", f"Запустить можно только утверждённый Паспорт; сейчас "
                                                f"'{passport.status.value}'.")
             self._check_app_launch(passport)
+            if self.require_preflight:
+                self._check_preflight(passport)
             ruleset = self.storage.latest_ruleset()
             if ruleset is None:
                 raise ControlError("conflict", "Нет ни одного слоя: администратор должен создать слой.")

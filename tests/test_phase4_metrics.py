@@ -131,7 +131,7 @@ def test_service_seeds_and_defines_metrics(storage):
 # ---------------- запуск теста приложения ----------------
 @pytest.fixture
 def svc():
-    service = ExperimentService(MemoryStorage())
+    service = ExperimentService(MemoryStorage(), require_preflight=False)  # предстартовая проверка — в П4
     service.ensure_default_metrics()
     service.add_layer(ADMIN, "ui")
     return service

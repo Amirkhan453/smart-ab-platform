@@ -67,6 +67,16 @@ def test_combat_split_equals_buckets_for():
     assert abs(ctrl.mean() - 0.30) < 0.035
 
 
+def test_buckets_for_rejects_empty_ids():
+    """Пустой идентификатор отклоняется, как в bucket(): иначе все пустые попадут в один бакет."""
+    for bad_salt in ("", None):
+        with pytest.raises(ValueError):
+            ASG.buckets_for(bad_salt, ["g1"])
+    with pytest.raises(ValueError, match="unit_id"):
+        ASG.buckets_for("exp_x", ["g1", ""])
+    assert ASG.buckets_for("exp_x", []).tolist() == []
+
+
 def test_allocate_variant_buckets_exact():
     assert allocate_variant_buckets([100 / 3] * 3) == [3334, 3333, 3333]
     assert sum(allocate_variant_buckets([16.665, 16.665, 16.67, 50.0])) == N_BUCKETS

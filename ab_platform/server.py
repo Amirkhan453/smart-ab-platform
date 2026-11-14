@@ -15,7 +15,8 @@ HTTP-сервер гостевого домена (ТЗ v4: ASG-7, DAT-1; ТЗ v
 
 Запуск: uvicorn "ab_platform.server:create_app_from_env" --factory
   ABP_DB_PATH — файл базы контура управления; ABP_API_KEYS — ключи (см. ab_platform/auth.py);
-  ABP_EVENTS_DB_PATH — файл базы событий (показы, заказы, корректировки, события приложения).
+  ABP_EVENTS_DB_PATH — файл базы событий (показы, заказы, корректировки, события приложения);
+  ABP_PREFLIGHT_DISABLED=1 — стенд без истории: запуск без предстартовой проверки (видно в /health).
 """
 import json
 import os
@@ -27,9 +28,11 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from ab_platform.analysis import preflight, report_markdown, reproduce, run_analysis, run_due_analyses
 from ab_platform.auth import Auth
 from ab_platform.control import Actor, ControlError, ExperimentService, verify_ruleset
 from ab_platform.engine.ruleset_engine import evaluate_all
+from ab_platform.schemas.analysis import AnalysisRun
 from ab_platform.schemas.ruleset import Ruleset
 from ab_platform.events import (  # noqa: F401 — ExposureIn и ExposureStore импортируют отсюда тесты фаз 2–3
     AppEventIn, ExposureIn, ExposureStore, MemoryEventStore, OrderAdjustmentIn, OrderIn, SqliteEventStore,
@@ -257,7 +260,8 @@ def create_app(ruleset_store: Optional[RulesetStore] = None,
     def health() -> Dict[str, Any]:
         cur = source.current()
         return {"ruleset_version": cur[0].version if cur else None, "exposures": len(exposures),
-                "auth": "disabled" if auth.is_disabled else "keys", "control_plane": service is not None}
+                "auth": "disabled" if auth.is_disabled else "keys", "control_plane": service is not None,
+                "preflight": None if service is None else ("required" if service.require_preflight else "disabled")}
 
     @app.get("/events/health")
     def events_health(request: Request) -> Dict[str, Any]:
@@ -298,6 +302,7 @@ def create_app(ruleset_store: Optional[RulesetStore] = None,
             "resume": lambda a: service.resume(a, experiment_id),
             "stop": lambda a: service.stop(a, experiment_id),
             "ramp": lambda a: service.ramp(a, experiment_id, body.get("ramp_pct")),
+            "preflight": lambda a: preflight(service, exposures, experiment_id, a),
             "advance": lambda a: service.advance(a, experiment_id, str(body.get("to", ""))),
         }
         if action not in commands:
@@ -307,11 +312,75 @@ def create_app(ruleset_store: Optional[RulesetStore] = None,
             manager(request)
             raise _HttpError(422, "нужно число ramp_pct")
         result = command(request, experiment_id, commands[action])
+        if isinstance(result, AnalysisRun):
+            return run_summary(result)
         if isinstance(result, Ruleset):
             passport = service.get(experiment_id, next(
                 (r.passport_version for r in result.experiments if r.passport_id == experiment_id), None))
             return {"ruleset_version": result.version, "status": passport.status.value, "version": passport.version}
         return dump(result)
+
+    def run_summary(run: AnalysisRun) -> Dict[str, Any]:
+        r = run.result
+        return {"run_id": run.run_id, "kind": run.inputs.kind, "experiment_id": run.inputs.experiment_id,
+                "passport_version": run.inputs.passport_version, "cutoff": run.inputs.cutoff,
+                "created_at": run.created_at, "decision": r.get("decision"), "passed": r.get("passed"),
+                "problems": r.get("problems")}
+
+    def need_run(request: Request, run_id: str) -> AnalysisRun:
+        manager(request)
+        run = service.storage.get_analysis_run(run_id)
+        if run is None:
+            raise _HttpError(404, f"запуска {run_id} нет")
+        return run
+
+    @app.get("/analysis-runs")
+    def list_runs(request: Request, experiment_id: Optional[str] = None, kind: Optional[str] = None):
+        manager(request)
+        return [run_summary(r) for r in service.storage.list_analysis_runs(experiment_id, kind)]
+
+    @app.get("/analysis-runs/{run_id}")
+    def get_run(request: Request, run_id: str) -> Dict[str, Any]:
+        return need_run(request, run_id).model_dump(mode="json")
+
+    @app.get("/analysis-runs/{run_id}/report.md")
+    def get_report(request: Request, run_id: str) -> Response:
+        run = need_run(request, run_id)
+        if run.inputs.kind == "preflight":
+            raise _HttpError(404, "у предстартовой проверки нет отчёта: смотрите сам запуск")
+        return Response(report_markdown(run), media_type="text/markdown; charset=utf-8")
+
+    @app.post("/analysis-runs")
+    def new_run(request: Request, body: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+        """Анализ по запросу человека (аналитик или администратор): monitoring или final."""
+        eid, kind = str(body.get("experiment_id", "")), str(body.get("kind", "monitoring"))
+
+        def go(actor):
+            ExperimentService._require(actor, "analyst", "admin")
+            return run_analysis(service, exposures, eid, kind, actor=actor.subject)
+        return run_summary(command(request, eid, go))
+
+    @app.post("/analysis-runs/{run_id}/reproduce")
+    def reproduce_run(request: Request, run_id: str) -> Dict[str, Any]:
+        need_run(request, run_id)
+
+        def go(actor):
+            ExperimentService._require(actor, "analyst", "admin")
+            return reproduce(service, exposures, run_id)
+        return command(request, None, go)
+
+    @app.post("/scheduler/run")
+    def scheduler_run(request: Request) -> List[Dict[str, Any]]:
+        """Ежедневный проход по тестам (cron вызывает с ключом администратора)."""
+        def go(actor):
+            ExperimentService._require(actor, "admin")
+            return run_due_analyses(service, exposures)
+        return command(request, None, go)
+
+    @app.get("/alerts")
+    def list_alerts(request: Request, experiment_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        manager(request)
+        return [a.model_dump(mode="json") for a in service.storage.list_alerts(experiment_id)]
 
     @app.get("/metrics")
     def list_metrics(request: Request) -> List[Dict[str, Any]]:
@@ -373,7 +442,8 @@ def create_app_from_env() -> FastAPI:
     auth = Auth.from_env()
     storage = SqliteStorage(path)
     storage.verify_audit()
-    service = ExperimentService(storage)
+    # предстартовая проверка обязательна; стенд без истории заказов отключает её только явно — как и ключи
+    service = ExperimentService(storage, require_preflight=os.environ.get("ABP_PREFLIGHT_DISABLED") != "1")
     service.ensure_default_metrics()
     current = service.ruleset()
     problems = verify_ruleset(current, storage) if current is not None else []

@@ -23,7 +23,8 @@ IOS = {"platform": "ios", "app_version": "5.4"}
 @pytest.fixture(params=["memory", "sqlite"])
 def svc(request, tmp_path):
     storage = MemoryStorage() if request.param == "memory" else SqliteStorage(str(tmp_path / "ab.db"))
-    service = ExperimentService(storage, intersection_matrix={"exp_push": ["exp_coupon"]})
+    # предстартовая проверка (фаза 4) требует истории заказов; контур фазы 3 проверяется без неё
+    service = ExperimentService(storage, intersection_matrix={"exp_push": ["exp_coupon"]}, require_preflight=False)
     service.ensure_default_metrics()
     service.add_layer(ADMIN, "ui")
     yield service
@@ -362,8 +363,9 @@ def test_every_command_is_audited_and_chain_is_valid(svc):
         ("passport.sealed", "petrov"), ("experiment.start", "ivanova"), ("experiment.ramp", "ivanova"),
         ("experiment.pause", "root"), ("experiment.resume", "ivanova"), ("experiment.stop", "ivanova")]
     assert log[3].details["passport_hash"] == svc.get("exp_menu").passport_hash
-    assert log[4].details == {"version": 1, "from": "approved", "to": "running", "ruleset_version": 2, "ramp_pct": 10.0,
-                              "rule": "exp_menu@v1"}
+    assert {k: v for k, v in log[4].details.items() if k != "at"} == {
+        "version": 1, "from": "approved", "to": "running", "ruleset_version": 2, "ramp_pct": 10.0, "rule": "exp_menu@v1"}
+    assert log[4].details["at"].endswith("+00:00")
     assert log[5].details["from"] == 10.0 and log[5].details["to"] == 50 and log[5].details["ruleset_version"] == 3
     first = [r.action for r in svc.storage.audit() if r.experiment_id is None]
     assert first[:8] == ["metric.seed"] * 7 + ["layer.add"] and svc.storage.verify_audit() == len(svc.storage.audit())

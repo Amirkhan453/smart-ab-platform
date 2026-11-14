@@ -10,6 +10,7 @@ Storage — интерфейс. Реализации: MemoryStorage (тесты 
 - версии ruleset только добавляются, строго по порядку (v, v+1, …);
 - аудит только дополняется; записи связаны хэш-цепочкой, verify_audit находит правку, вставку и удаление;
 - версии метрик только добавляются, по порядку (1, 2, …), и не меняются (MET-1);
+- запуски анализа и тревоги только добавляются; запуск с тем же run_id и тем же результатом — не дубль (RPT-1);
 - transaction() — всё или ничего: смена статуса, новая версия ruleset и запись аудита сохраняются вместе.
 """
 import hashlib
@@ -22,6 +23,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Iterator, List, Optional, Protocol
 
 from ab_platform.metrics import MetricVersion
+from ab_platform.schemas.analysis import Alert, AnalysisRun
 from ab_platform.schemas.passport import ALLOWED_TRANSITIONS, ExperimentPassport
 from ab_platform.schemas.ruleset import Ruleset
 
@@ -102,6 +104,23 @@ class Storage(Protocol):
     def save_metric(self, metric: MetricVersion) -> None: ...
     def get_metric(self, name: str, version: Optional[int] = None) -> Optional[MetricVersion]: ...
     def list_metrics(self) -> List[MetricVersion]: ...
+    def save_analysis_run(self, run: AnalysisRun) -> None: ...
+    def get_analysis_run(self, run_id: str) -> Optional[AnalysisRun]: ...
+    def list_analysis_runs(self, experiment_id: Optional[str] = None,
+                           kind: Optional[str] = None) -> List[AnalysisRun]: ...
+    def save_alert(self, alert: Alert) -> None: ...
+    def list_alerts(self, experiment_id: Optional[str] = None) -> List[Alert]: ...
+
+
+def _check_run_write(run: AnalysisRun, existing: Optional[AnalysisRun]) -> bool:
+    """True — записать; False — тот же запуск уже сохранён. Другой результат при тех же входах — ошибка."""
+    if run.run_id != run.inputs.run_id:
+        raise StorageError(f"run_id {run.run_id} не совпадает с хэшем входов.")
+    if existing is None:
+        return True
+    if existing.result_json() == run.result_json() and existing.input_hash == run.input_hash:
+        return False
+    raise StorageError(f"Запуск {run.run_id} уже сохранён с другим результатом: расчёт не воспроизводится.")
 
 
 def _check_metric_write(metric: MetricVersion, top: int, existing: Optional[MetricVersion]) -> bool:
@@ -128,6 +147,8 @@ class MemoryStorage:
         self._rulesets: List[Ruleset] = []
         self._audit: List[AuditRecord] = []
         self._metrics: Dict[str, Dict[int, MetricVersion]] = {}
+        self._runs: Dict[str, AnalysisRun] = {}
+        self._alerts: List[Alert] = []
         self._depth = 0
 
     @contextmanager
@@ -136,12 +157,12 @@ class MemoryStorage:
             if self._depth:
                 raise StorageError("Вложенные транзакции не поддерживаются.")
             snapshot = ({k: dict(v) for k, v in self._passports.items()}, list(self._rulesets), list(self._audit),
-                        {k: dict(v) for k, v in self._metrics.items()})
+                        {k: dict(v) for k, v in self._metrics.items()}, dict(self._runs), list(self._alerts))
             self._depth = 1
             try:
                 yield
             except BaseException:
-                self._passports, self._rulesets, self._audit, self._metrics = snapshot
+                self._passports, self._rulesets, self._audit, self._metrics, self._runs, self._alerts = snapshot
                 raise
             finally:
                 self._depth = 0
@@ -214,6 +235,28 @@ class MemoryStorage:
         with self._lock:
             return [m for _, v in sorted(self._metrics.items()) for _, m in sorted(v.items())]
 
+    def save_analysis_run(self, run: AnalysisRun) -> None:
+        with self._lock:
+            if _check_run_write(run, self._runs.get(run.run_id)):
+                self._runs[run.run_id] = run
+
+    def get_analysis_run(self, run_id: str) -> Optional[AnalysisRun]:
+        with self._lock:
+            return self._runs.get(run_id)
+
+    def list_analysis_runs(self, experiment_id: Optional[str] = None, kind: Optional[str] = None) -> List[AnalysisRun]:
+        with self._lock:
+            return [r for r in self._runs.values() if (experiment_id is None or r.inputs.experiment_id == experiment_id)
+                    and (kind is None or r.inputs.kind == kind)]
+
+    def save_alert(self, alert: Alert) -> None:
+        with self._lock:
+            self._alerts.append(alert)
+
+    def list_alerts(self, experiment_id: Optional[str] = None) -> List[Alert]:
+        with self._lock:
+            return [a for a in self._alerts if experiment_id is None or a.experiment_id == experiment_id]
+
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -238,6 +281,18 @@ CREATE TABLE IF NOT EXISTS metrics (
     body       TEXT NOT NULL,
     created_at TEXT NOT NULL,
     PRIMARY KEY (name, version)
+);
+CREATE TABLE IF NOT EXISTS analysis_runs (
+    seq           INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id        TEXT NOT NULL UNIQUE,
+    experiment_id TEXT NOT NULL,
+    kind          TEXT NOT NULL,
+    body          TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS alerts (
+    seq           INTEGER PRIMARY KEY AUTOINCREMENT,
+    experiment_id TEXT NOT NULL,
+    body          TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS audit (
     seq           INTEGER PRIMARY KEY,
@@ -416,3 +471,40 @@ class SqliteStorage:
         with self._lock:
             rows = self._conn.execute("SELECT body FROM metrics ORDER BY name, version").fetchall()
         return [MetricVersion.model_validate_json(r[0]) for r in rows]
+
+    def save_analysis_run(self, run: AnalysisRun) -> None:
+        with self._write():
+            if _check_run_write(run, self.get_analysis_run(run.run_id)):
+                self._conn.execute("INSERT INTO analysis_runs (run_id, experiment_id, kind, body) VALUES (?, ?, ?, ?)",
+                                   (run.run_id, run.inputs.experiment_id, run.inputs.kind, run.model_dump_json()))
+
+    def get_analysis_run(self, run_id: str) -> Optional[AnalysisRun]:
+        with self._lock:
+            row = self._conn.execute("SELECT body FROM analysis_runs WHERE run_id = ?", (run_id,)).fetchone()
+        return AnalysisRun.model_validate_json(row[0]) if row else None
+
+    def list_analysis_runs(self, experiment_id: Optional[str] = None, kind: Optional[str] = None) -> List[AnalysisRun]:
+        where, args = [], []
+        if experiment_id is not None:
+            where.append("experiment_id = ?")
+            args.append(experiment_id)
+        if kind is not None:
+            where.append("kind = ?")
+            args.append(kind)
+        sql = "SELECT body FROM analysis_runs" + (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY seq"
+        with self._lock:
+            rows = self._conn.execute(sql, args).fetchall()
+        return [AnalysisRun.model_validate_json(r[0]) for r in rows]
+
+    def save_alert(self, alert: Alert) -> None:
+        with self._write():
+            self._conn.execute("INSERT INTO alerts (experiment_id, body) VALUES (?, ?)",
+                               (alert.experiment_id, alert.model_dump_json()))
+
+    def list_alerts(self, experiment_id: Optional[str] = None) -> List[Alert]:
+        sql, args = "SELECT body FROM alerts", ()
+        if experiment_id is not None:
+            sql, args = sql + " WHERE experiment_id = ?", (experiment_id,)
+        with self._lock:
+            rows = self._conn.execute(sql + " ORDER BY seq", args).fetchall()
+        return [Alert.model_validate_json(r[0]) for r in rows]
