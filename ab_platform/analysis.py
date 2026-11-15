@@ -26,7 +26,7 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 
-from ab_platform.control import Actor, ControlError, ExperimentService, rule_id
+from ab_platform.control import Actor, ControlError, ExperimentService, rule_from_passport, rule_id
 from ab_platform.engine.assignment import (
     DeterministicAssignmentEngine as ASG, allocate_variant_buckets,
 )
@@ -167,9 +167,18 @@ def _compute(passport: ExperimentPassport, metrics: List[Tuple[str, MetricVersio
         "estimand": "triggered", "attribution_window_days": W, "analysis_day": analysis_day,
         "population": population, "code_version": code_version(),
     }
+    shortage = None
     if min(counts.values()) < 2:
+        shortage = "Мало показанных гостей: в каждом варианте нужно хотя бы 2."
+    else:
+        # у ratio-метрики (средний чек, доля отмен) без единого заказа в варианте знаменатель 0 — считать нечего
+        empty = [f"{m.name} в варианте {v}" for _, m in metrics if m.metric_type == MetricType.RATIO
+                 for v, g in table.groupby("variant")[m.columns()[1]] if g.sum() <= 0]
+        if empty:
+            shortage = "Мало данных: нет заказов для ratio-метрики — " + ", ".join(empty) + "."
+    if shortage:
         return {**base, "decision": "INSUFFICIENT_DATA", "can_trust_data": False, "blinded": analysis_day is not None,
-                "summary": "Мало показанных гостей: в каждом варианте нужно хотя бы 2.", "caveats": caveats,
+                "summary": shortage, "caveats": caveats, "covariate": None,
                 "srm": {}, "segments_srm": {}, "guardrails": [], "auto_pause": {"breached": []}}, input_hash
 
     covariate = f"{primary.name}__pre" if primary.metric_type != MetricType.RATIO and passport.use_cuped else None
@@ -191,10 +200,11 @@ def _compute(passport: ExperimentPassport, metrics: List[Tuple[str, MetricVersio
     result = {
         **base,
         "decision": report.decision_status, "can_trust_data": report.can_trust_data, "blinded": blinded,
-        "summary": report.executive_summary_ru, "winning_variant": None if blinded else report.winning_variant,
+        # до горизонта ядро само скрывает эффект: победителя, primary и вторичные метрики (слепой режим)
+        "summary": report.executive_summary_ru, "winning_variant": report.winning_variant,
         "primary": report.primary_metric_result, "comparisons": report.variant_comparisons,
-        "secondary": report.secondary_results,  # до горизонта ядро отдаёт пустой список (слепой режим)
-        "guardrails": report.guardrail_results, "cuped": report.cuped_diagnostics,
+        "secondary": report.secondary_results,
+        "guardrails": report.guardrail_results, "covariate": covariate, "cuped": report.cuped_diagnostics,
         "srm": report.srm_diagnosis, "segments_srm": segments,
         "srm_detected": bool(not report.can_trust_data or any(s["srm_detected"] for s in segments.values())),
         "hygiene": {"double_exposure_removed_pct": report.double_exposure_removed_pct,
@@ -251,11 +261,8 @@ def reproduce(service: ExperimentService, events, run_id: str) -> Dict[str, Any]
         raise ControlError("invalid", "Предстартовую проверку повторяют новым запуском.")
     passport = service.get(inp.experiment_id, inp.passport_version)
     metrics = [(m["role"], service.metric(m["ref"])) for m in inp.metrics]
-    ruleset = service.ruleset()
-    rule = next((r for r in (ruleset.experiments if ruleset else ()) if r.experiment_id == inp.rule_id), None)
-    if rule is None:  # правило уже убрано из ruleset (архив) — строится из Паспорта
-        from ab_platform.control import rule_from_passport
-        rule = rule_from_passport(passport, kill_switch=True)
+    # правило — из Паспорта: анализу нужны только его идентификатор и тип единицы, а в архиве правила в ruleset уже нет
+    rule = rule_from_passport(passport)
     started = _utc(service.lifecycle_times(inp.experiment_id, inp.passport_version)["started_at"])
     result, input_hash = _compute(passport, metrics, events, rule, inp.kind, _utc(inp.cutoff), inp.upto_seq, started)
     same_code = inp.code_version == code_version()
@@ -434,7 +441,7 @@ def preflight(service: ExperimentService, events, experiment_id: str, actor: Act
         p = np.asarray(p_values)
         fpr = float(np.mean(p < passport.alpha)) if len(p) else float("nan")
         result["aa"] = {"runs": int(len(p)), "fpr": fpr, "ks_p": float(stats.kstest(p, "uniform").pvalue) if len(p) else None,
-                        "range": list(PREFLIGHT_FPR_RANGE)}
+                        "range": list(PREFLIGHT_FPR_RANGE), "covariate": covariate}
         if not (PREFLIGHT_FPR_RANGE[0] <= fpr <= PREFLIGHT_FPR_RANGE[1]):
             problems.append(f"A/A на истории: доля ложных срабатываний {fpr:.1%} вне [3%; 7%]")
         # баланс настоящей соли: вариант гостя — по бакету соли правила, как в движке (шаг 2)
@@ -447,7 +454,7 @@ def preflight(service: ExperimentService, events, experiment_id: str, actor: Act
                 c_vals = table.loc[variant == control.variant_id, col].to_numpy(dtype=float)
                 smd[col] = max(_smd(table.loc[variant == v.variant_id, col].to_numpy(dtype=float), c_vals)
                                for v in passport.variants if not v.is_control)
-        result["balance"] = {"max_smd": max(smd.values()) if smd else 0.0, "by_column": smd,
+        result["balance"] = {"max_smd": max(smd.values()), "by_column": smd,  # primary в таблице всегда
                              "threshold": PREFLIGHT_MAX_SMD}
         bad = [c for c, v in smd.items() if v >= PREFLIGHT_MAX_SMD]
         if bad:

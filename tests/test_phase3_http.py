@@ -90,6 +90,16 @@ def test_server_does_not_start_without_keys(monkeypatch, tmp_path):
     monkeypatch.delenv("ABP_DB_PATH", raising=False)
     with pytest.raises(RuntimeError, match="ABP_DB_PATH"):
         create_app_from_env()
+    monkeypatch.setenv("ABP_DB_PATH", str(tmp_path / "ab.db"))
+    monkeypatch.setenv("ABP_EVENTS_DB_PATH", "  ")
+    with pytest.raises(RuntimeError, match="ABP_EVENTS_DB_PATH"):
+        create_app_from_env()
+    monkeypatch.setenv("ABP_EVENTS_DB_PATH", str(tmp_path / "events.db"))
+    for flag, mode in (("1", "disabled"), ("0", "required")):
+        monkeypatch.setenv("ABP_PREFLIGHT_DISABLED", flag)
+        app = create_app_from_env()
+        assert TestClient(app).get("/health").json()["preflight"] == mode
+        app.state.service.storage.close()
 
 
 def test_sdk_routes_require_a_key_and_management_requires_a_person():

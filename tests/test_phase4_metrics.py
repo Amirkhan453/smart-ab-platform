@@ -337,3 +337,107 @@ def test_cnv2_orders_before_exposure_do_not_enter_effect(world):
     assert after["revenue_per_guest"].equals(before["revenue_per_guest"])
     t = after["variant"] == "treatment"
     assert np.allclose(after.loc[t, "revenue_per_guest__pre"] - before.loc[t, "revenue_per_guest__pre"], 5000.0)
+
+
+# ---------------- граничные случаи (по итогам сплошной проверки порчей) ----------------
+def test_defined_metric_is_stored_and_usable(svc):
+    m = svc.define_metric(ANALYST, {"name": "refund_free_revenue", "title": "Новая метрика", "formula": "revenue"})
+    assert svc.metric("refund_free_revenue@1") == m and svc.storage.get_metric("refund_free_revenue") == m
+
+
+def test_metric_without_registry_ref_is_named_once(svc):
+    approved(svc, "exp_plain", primary_metric=base()["primary_metric"].model_dump())
+    with pytest.raises(ControlError) as e:
+        svc.start(OWNER, "exp_plain")
+    assert e.value.kind == "invalid" and str(e.value).count("'revenue'") == 1
+
+
+def test_service_requires_preflight_by_default():
+    service = ExperimentService(MemoryStorage())
+    service.ensure_default_metrics()
+    service.add_layer(ADMIN, "ui")
+    approved(service, "exp_menu")
+    with denied("conflict", "Нет предстартовой проверки"):
+        service.start(OWNER, "exp_menu")
+
+
+def test_lifecycle_times_are_per_version():
+    now = [T0]
+    service = ExperimentService(MemoryStorage(), require_preflight=False, clock=lambda: now[0])
+    service.ensure_default_metrics()
+    service.add_layer(ADMIN, "ui")
+    approved(service, "exp_menu")
+    now[0] = T0 + timedelta(hours=1)
+    service.start(OWNER, "exp_menu")
+    now[0] = T0 + timedelta(days=5)
+    service.stop(OWNER, "exp_menu")
+    now[0] = T0 + timedelta(days=6)
+    service.new_version(OWNER, "exp_menu", {"mde_relative": 0.05})
+    service.submit(OWNER, "exp_menu")
+    service.approve(ANALYST, "exp_menu")
+    now[0] = T0 + timedelta(days=7)
+    service.start(OWNER, "exp_menu")
+    iso = lambda t: t.isoformat()  # noqa: E731
+    assert service.lifecycle_times("exp_menu", 1) == {"started_at": iso(T0 + timedelta(hours=1)),
+                                                      "stopped_at": iso(T0 + timedelta(days=5))}
+    assert service.lifecycle_times("exp_menu", 2) == {"started_at": iso(T0 + timedelta(days=7)), "stopped_at": None}
+
+
+def test_unit_table_boundaries(store):
+    def x(eid, unit, day, variant):
+        return ExposureIn(event_id=eid, event_time=at(day), unit_id=unit, experiment_id="e@v1", variant_id=variant,
+                          ruleset_version=1)
+
+    def ev(eid, unit, day, kind="app_crash"):
+        return AppEventIn(event_id=eid, unit_id=unit, unit_type="guest_id", event_type=kind, event_time=at(day))
+    store.add([x("b1", "b1", 0, "control"), x("b2", "b2", 0, "treatment"), x("b3", "b3", 7, "control")])
+    store.add_app_events([ev("c1", "b1", 0), ev("c2", "b2", 7), ev("p2", "b2", -14, "payment_error")])
+    metrics = [REG["crash_share"], REG["payment_error_share"]]
+    cut = T0 + timedelta(days=7)
+    tab = build_unit_table(store, "e@v1", metrics, 7, 14, cut).set_index("unit_id")
+    assert list(tab.index) == ["b1", "b2"]  # показ ровно в момент среза — ещё не в анализе
+    assert tab.loc["b1", "crash_share"] == 1 and tab.loc["b2", "crash_share"] == 0  # [показ; показ + W)
+    assert tab.loc["b2", "payment_error_share__pre"] == 1  # начало пре-периода включено
+    assert tab["window_complete"].all() and set(tab["window_end"]) == {cut.isoformat(timespec="microseconds")}
+    with pytest.raises(ValueError):
+        build_unit_table(store, "e@v1", metrics, 7, 0, cut)
+    empty = build_unit_table(MemoryEventStore(), "e@v1", [REG["conversion"], REG["avg_check"]], 7, 14, cut)
+    assert list(empty.columns)[-4:] == ["conversion", "conversion__pre", "avg_check__num", "avg_check__den"]
+
+
+def test_history_table_rules(store):
+    from ab_platform.engine.unit_table import build_history_table
+    start, split, end = T0, T0 + timedelta(days=7), T0 + timedelta(days=14)
+
+    def o(oid, unit, day):
+        return OrderIn(order_id=oid, unit_id=unit, unit_type="guest_id", order_time=at(day), amount=100.0)
+    store.add_orders([o("h1", "h1", 0), o("h2", "h2", 14), o("h3", "h3", 7)])
+    store.add_app_events([
+        AppEventIn(event_id="c4", unit_id="h4", unit_type="guest_id", event_type="app_crash", event_time=at(0)),
+        AppEventIn(event_id="c5", unit_id="h5", unit_type="device_id", event_type="app_crash", event_time=at(8)),
+        AppEventIn(event_id="c6", unit_id="h6", unit_type="guest_id", event_type="app_crash", event_time=at(14)),
+    ])
+    metrics = [REG["conversion"], REG["crash_share"], REG["avg_check"]]
+    tab = build_history_table(store, metrics, start, split, end).set_index("unit_id")
+    assert list(tab.index) == ["h1", "h3", "h4"]  # [start; end): h2 и h6 — ровно в end, h5 — другой тип единицы
+    assert (tab.loc["h1", "conversion"], tab.loc["h1", "conversion__pre"]) == (0, 1)
+    assert (tab.loc["h3", "conversion"], tab.loc["h3", "conversion__pre"]) == (1, 0)  # split — уже окно
+    assert tab.loc["h4", "crash_share__pre"] == 1
+    assert {"avg_check__num", "avg_check__den"} <= set(tab.columns) and "avg_check__pre" not in tab.columns
+    for bad in ((start, start, end), (start, end, end), (end, split, start),
+                (start.replace(tzinfo=None), split, end)):
+        with pytest.raises(ValueError):
+            build_history_table(store, metrics, *bad)
+
+
+def test_metric_title_bounds_and_immutability():
+    m = next(x for x in DEFAULT_METRICS if x.name == "conversion")
+    body = m.model_dump()
+    for title, ok in (("abc", True), ("ab", False), ("я" * 200, True), ("я" * 201, False)):
+        if ok:
+            MetricVersion(**{**body, "title": title})
+        else:
+            with pytest.raises(ValidationError):
+                MetricVersion(**{**body, "title": title})
+    with pytest.raises(ValidationError):
+        m.title = "другое"  # версия метрики неизменяема

@@ -135,3 +135,90 @@ def test_payload_is_accepted_by_event_store():
     assert {"cancel", "refund"} == set(ev.adjustments["kind"])
     with pytest.raises(ValueError):
         ev.payload("visits")
+
+
+def test_generator_rejects_bad_input(world):
+    with pytest.raises(ValueError, match="часовым поясом"):
+        simulate_app_world(1, 10, datetime(2026, 9, 1))
+    for n, pre, test in ((0, 28, 28), (10, 0, 28), (10, 28, 0)):
+        with pytest.raises(ValueError, match="≥ 1"):
+            simulate_app_world(1, n, START, pre_days=pre, test_days=test)
+    tiny = simulate_app_world(1, 1, START, pre_days=1, test_days=1)  # нижняя граница допустима
+    assert len(tiny.guests) == 1 and tiny.total_days == 2
+    treated = np.ones(len(world.guests), dtype=bool)
+    for kw in ({"lift": -1.0}, {"crash_lift": -1.0}):
+        with pytest.raises(ValueError, match="> -1"):
+            world.realize(treated, **kw)
+    with pytest.raises(ValueError, match="Длина treated"):
+        world.realize(treated[:-1])
+    with pytest.raises(ValueError):
+        AppParams().p_cancel = 0.5  # параметры неизменяемы
+
+
+def test_noise_and_multipliers_are_mean_one(world, base):
+    """Множители периода и шум чека — логнормальные со средним 1: генератор не сдвигает уровень выручки."""
+    g = world.guests
+    assert abs(g["m_pre"].mean() - 1) < 0.02 and abs(g["m_test"].mean() - 1) < 0.02
+    check = g.set_index("unit_id")["check"]
+    noise = base.orders["amount"] / check.loc[base.orders["unit_id"]].to_numpy()
+    assert abs(noise.mean() - 1) < 0.01, noise.mean()
+
+
+def test_attributes_follow_params(world):
+    g = world.guests
+    p = world.params
+    assert abs((g["platform"] == "web").mean() - p.web_share) < 0.005
+    assert abs((g["platform"] == "ios").mean() - p.ios_share) < 0.01
+    assert abs(g["has_delivery"].mean() - p.has_delivery_share) < 0.01
+    assert abs(g["is_new_guest"].mean() - p.new_guest_share) < 0.01
+    # у активных гостей чаще iOS и свежая версия
+    act = g["lam"].rank(pct=True)
+    top, low = act > 0.8, act < 0.2
+    assert (g.loc[top, "platform"] == "ios").mean() > (g.loc[low, "platform"] == "ios").mean() + 0.2
+    versions = ["5.0", "5.1.9", "5.2", "5.4.1", "5.10", "6.0"]
+    v = g["app_version"].map(versions.index)
+    assert set(g["app_version"]) == set(versions) and 2.4 < v.mean() < 2.6, v.mean()
+    assert v[top].mean() > v[low].mean() + 1
+
+
+def test_amounts_discounts_and_adjustment_delays(world, base):
+    treated = np.random.default_rng(6).random(len(world.guests)) < 0.5
+    ev = world.realize(treated, lift=0.2)
+    assert list(ev.orders.columns) == ["order_id", "unit_id", "unit_type", "order_time", "amount", "discount", "day",
+                                       "counterfactual"]
+    assert isinstance(ev.orders.index, pd.RangeIndex) and (~ev.orders["counterfactual"]).sum() > 1000
+    cents = lambda s: np.allclose(s * 100, np.round(s * 100), atol=1e-6)  # суммы — до копейки
+    assert cents(ev.orders["amount"]) and cents(ev.orders["discount"])
+    rate = ev.orders["discount"] / ev.orders["amount"]
+    assert 0.075 < rate.mean() < 0.085 and 0.027 < rate.std() < 0.033, (rate.mean(), rate.std())
+    adj = base.adjustments.merge(base.orders[["order_id", "order_time", "amount"]].rename(columns={"amount": "order_amount"}),
+                                 on="order_id")
+    delay = (adj["event_time"] - adj["order_time"]).dt.total_seconds()
+    cancel, refund = adj["kind"] == "cancel", adj["kind"] == "refund"
+    assert 300 <= delay[cancel].min() < 400 and 7100 < delay[cancel].max() <= 7200
+    assert 86_400 <= delay[refund].min() < 1.1 * 86_400 and 2.9 * 86_400 < delay[refund].max() <= 3 * 86_400
+    share = adj.loc[refund, "amount"] / adj.loc[refund, "order_amount"]
+    assert cents(adj.loc[refund, "amount"]) and share.min() > 0.09 and share.max() < 0.51
+    assert 0.016 < refund.sum() / len(base.orders) < 0.024
+
+
+def test_payment_errors_precede_their_order(base):
+    errs = base.app_events[base.app_events["event_type"] == "payment_error"]
+    order_id = errs["event_id"].str.rsplit("-err", n=1).str[0]
+    k = errs["event_id"].str.rsplit("-err", n=1).str[1].astype(int)
+    t_order = base.orders.set_index("order_id").loc[order_id, "order_time"].to_numpy()
+    gap = (t_order - errs["event_time"].to_numpy()) / np.timedelta64(1, "s")
+    assert len(errs) > 1000 and (gap == (k.to_numpy() + 1) * 60).all()  # k-я ошибка — за (k + 1) минут до заказа
+
+
+def test_crash_lift_negative_and_truth_arithmetic(world, base):
+    treated = np.random.default_rng(7).random(len(world.guests)) < 0.5
+    ev = world.realize(treated, crash_lift=-0.5)
+    shown_t = set(world.guests.loc[treated & ~np.isnan(world.guests["exposure_day"]), "unit_id"])
+    crash = lambda e: e.app_events[e.app_events["event_type"] == "app_crash"]["unit_id"]
+    n_t, n_t0 = crash(ev).isin(shown_t).sum(), crash(base).isin(shown_t).sum()
+    assert (~crash(ev).isin(shown_t)).sum() == (~crash(base).isin(shown_t)).sum() and n_t < 0.85 * n_t0
+    for lift in (0.1, -0.1):
+        t = world.realize(treated, lift=lift).truth
+        assert np.sign(t.network_total_abs) == np.sign(lift)
+        assert t.per_restaurant_mean_abs == pytest.approx(t.network_total_abs / t.n_treated_cells)

@@ -281,3 +281,87 @@ def test_sqlite_two_processes_write_concurrently(tmp_path):
     [t.join() for t in threads]
     assert errors == [] and stores[0].frame("orders")["seq"].tolist() == list(range(1, 161))
     [s.close() for s in stores]
+
+
+# ---------------- граничные случаи (по итогам сплошной проверки порчей) ----------------
+@pytest.mark.parametrize("model,field,limit,valid", [
+    (ExposureIn, "event_id", 128, dict(event_time="2026-11-10T10:00:00Z", unit_id="g1", experiment_id="e",
+                                       variant_id="c", ruleset_version=1)),
+    (ExposureIn, "unit_id", 1024, dict(event_id="x", event_time="2026-11-10T10:00:00Z", experiment_id="e",
+                                       variant_id="c", ruleset_version=1)),
+    (OrderIn, "order_id", 128, dict(unit_id="g1", unit_type="guest_id", order_time="2026-11-10T10:00:00Z", amount=1.0)),
+    (OrderIn, "unit_id", 1024, dict(order_id="o", unit_type="guest_id", order_time="2026-11-10T10:00:00Z", amount=1.0)),
+    (OrderAdjustmentIn, "adjustment_id", 128, dict(order_id="o", kind="cancel", event_time="2026-11-10T10:00:00Z")),
+    (OrderAdjustmentIn, "order_id", 128, dict(adjustment_id="a", kind="cancel", event_time="2026-11-10T10:00:00Z")),
+    (AppEventIn, "event_id", 128, dict(unit_id="g1", unit_type="guest_id", event_type="app_crash",
+                                       event_time="2026-11-10T10:00:00Z")),
+    (AppEventIn, "unit_id", 1024, dict(event_id="e", unit_type="guest_id", event_type="app_crash",
+                                       event_time="2026-11-10T10:00:00Z")),
+])
+def test_identifier_length_limits(model, field, limit, valid):
+    model(**valid, **{field: "a" * limit})
+    with pytest.raises(ValidationError):
+        model(**valid, **{field: "a" * (limit + 1)})
+
+
+def test_amount_and_item_limits():
+    base = dict(order_id="o1", unit_id="g1", unit_type="guest_id", order_time="2026-11-10T12:00:00Z")
+    OrderIn(**base, amount=10_000_000.0, discount=10_000_000.0,
+            items=[{"sku": "s" * 64, "qty": 1000, "price": 0.0}])
+    for bad in (dict(amount=10_000_000.01), dict(amount=1.0, discount=10_000_000.01),
+                dict(amount=1.0, items=[{"sku": "s" * 65, "qty": 1, "price": 1.0}]),
+                dict(amount=1.0, items=[{"sku": "s", "qty": 1001, "price": 1.0}])):
+        with pytest.raises(ValidationError):
+            OrderIn(**base, **bad)
+    adj = dict(adjustment_id="a", order_id="o", kind="refund", event_time="2026-11-10T12:00:00Z")
+    OrderAdjustmentIn(**adj, amount=10_000_000.0)
+    with pytest.raises(ValidationError):
+        OrderAdjustmentIn(**adj, amount=10_000_000.01)
+
+
+def test_adjustments_and_app_events_report_conflicts(store):
+    a = OrderAdjustmentIn(adjustment_id="a1", order_id="o1", kind="refund", amount=10.0, event_time="2026-11-10T12:00:00Z")
+    assert store.add_adjustments([a]).accepted == 1
+    r = store.add_adjustments([a, a.model_copy(update={"amount": 20.0})])
+    assert (r.accepted, r.duplicates, len(r.conflicts)) == (0, 1, 1) and r.conflicts[0]["adjustment_id"] == "a1"
+    e = AppEventIn(event_id="c1", unit_id="g1", unit_type="guest_id", event_type="app_crash",
+                   event_time="2026-11-10T12:00:00Z")
+    assert store.add_app_events([e]).accepted == 1
+    r = store.add_app_events([e, e.model_copy(update={"event_type": "payment_error"})])
+    assert (r.accepted, r.duplicates, len(r.conflicts)) == (0, 1, 1) and r.conflicts[0]["event_id"] == "c1"
+
+
+def test_first_exposure_tie_goes_to_earlier_accepted(store):
+    store.add([exposure(1, variant="treatment"), exposure(2, variant="control")])  # одно и то же время
+    assert store.first_exposures("exp@v1")["g1"]["variant_id"] == "treatment"
+
+
+def test_sqlite_close_releases_connection(tmp_path):
+    s = SqliteEventStore(str(tmp_path / "events.db"))
+    s.close()
+    with pytest.raises(sqlite3.ProgrammingError):
+        s.last_seq()
+
+
+def test_attribute_value_length_limit():
+    exposure(1, attributes={"platform": "ж" * 64})  # ровно 64 знака — допустимо
+    with pytest.raises(ValidationError, match="до 64 знаков"):
+        exposure(1, attributes={"platform": "ж" * 65})
+
+
+def test_legacy_jsonl_line_format_and_corrupt_first_line(tmp_path):
+    path = tmp_path / "exposures.jsonl"
+    s = ExposureStore(str(path))
+    s.add([exposure(1, unit="гость", attributes={"platform": "ios"})])
+    line = path.read_text(encoding="utf-8").strip()
+    # канонический вид: ключи по алфавиту, без пробелов, кириллица как есть
+    assert line.startswith('{"attributes":{"platform":"ios"},"event_id":"x1","event_time":') and '"unit_id":"гость"' in line
+    path.write_text("{недописано\n" + line + "\n", encoding="utf-8")  # битая — самая первая строка
+    again = ExposureStore(str(path))
+    assert again.corrupt_lines == 1 and len(again) == 1
+
+
+def test_canonical_rejects_nan():
+    from ab_platform.events import _canonical
+    with pytest.raises(ValueError):
+        _canonical({"x": float("nan")})

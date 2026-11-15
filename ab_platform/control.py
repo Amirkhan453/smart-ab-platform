@@ -365,7 +365,7 @@ class ExperimentService:
         for r in self.storage.audit(experiment_id):
             if r.details.get("version") != version:
                 continue
-            if r.action == "experiment.start" and started is None:
+            if r.action == "experiment.start":  # версия запускается один раз: после остановки — только новая
                 started = r.details.get("at")
             if r.action == "experiment.stop":
                 stopped = r.details.get("at")

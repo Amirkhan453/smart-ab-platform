@@ -107,7 +107,7 @@ def build_unit_table(
     apps["event_time"] = _utc(apps["event_time"])
 
     t0 = pop["t0"]
-    window_end = (t0 + timedelta(days=window_days)).where(t0 + timedelta(days=window_days) <= cut, cut)
+    window_end = (t0 + timedelta(days=window_days)).clip(upper=cut)
     win = _period_aggregates(orders, apps, units, t0, window_end)
     pre = _period_aggregates(orders, apps, units, t0 - timedelta(days=pre_days), t0)
 
@@ -138,7 +138,7 @@ def build_history_table(
     История до запуска для предстартовой проверки: гости с заказом или событием приложения в [start, end).
     Метрики — за [split, end) (как будто это окно теста), ковариата <имя>__pre — за [start, split).
     """
-    if not (start < split < end) or any(t.tzinfo is None for t in (start, split, end)):
+    if any(t.tzinfo is None for t in (start, split, end)) or not (start < split < end):
         raise ValueError("Нужно start < split < end, время с часовым поясом.")
     lo_all, mid, hi_all = (pd.Timestamp(t).tz_convert("UTC") for t in (start, split, end))
     orders = store.frame("orders", upto_seq)

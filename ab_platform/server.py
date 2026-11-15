@@ -362,8 +362,6 @@ def create_app(ruleset_store: Optional[RulesetStore] = None,
 
     @app.post("/analysis-runs/{run_id}/reproduce")
     def reproduce_run(request: Request, run_id: str) -> Dict[str, Any]:
-        need_run(request, run_id)
-
         def go(actor):
             ExperimentService._require(actor, "analyst", "admin")
             return reproduce(service, exposures, run_id)

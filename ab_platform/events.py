@@ -284,7 +284,7 @@ class ExposureStore(MemoryEventStore):
                     except ValueError:
                         self.corrupt_lines += 1  # недописанная строка при аварийной остановке
                         continue
-                    self._ingest("exposures", [ev], conflicts_matter=False)
+                    self.add([ev])
 
     def _after_write(self, kind: str, rows: List[Dict[str, Any]]) -> None:
         if self.path and kind == "exposures" and rows:
