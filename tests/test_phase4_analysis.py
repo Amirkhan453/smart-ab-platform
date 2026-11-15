@@ -147,6 +147,14 @@ def test_reproduce_is_byte_identical_even_after_late_events(finished):
                                    order_time=(lab.world.test_start + timedelta(days=1)).isoformat(), amount=99999.0)])
     res = reproduce(lab.svc, lab.events, run_id)
     assert res["identical"] and res["same_code_version"]
+    # MET-1: новая версия метрики не меняет сохранённый отчёт — он ссылается на метрика@1
+    saved = lab.svc.storage.get_analysis_run(run_id).result
+    v2 = lab.svc.define_metric(ANALYST, {"name": "revenue_per_guest", "title": "Выручка, винзоризация 95%",
+                                         "formula": "revenue", "winsorize_percentile": 0.95})
+    assert v2.ref == "revenue_per_guest@2"
+    assert lab.svc.storage.get_analysis_run(run_id).result == saved
+    assert "revenue_per_guest@1" in {m["ref"] for m in saved["metrics"]}
+    assert reproduce(lab.svc, lab.events, run_id)["identical"]
     # тот же запуск ещё раз — тот же run_id, без нового сохранения
     again = run_analysis(lab.svc, lab.events, "exp_menu", "final", lab.now,
                          upto_seq=lab.svc.storage.get_analysis_run(run_id).inputs.upto_seq)
