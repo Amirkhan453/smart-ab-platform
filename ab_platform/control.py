@@ -15,6 +15,8 @@ import threading
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
+from pydantic import ValidationError
+
 from ab_platform.engine.ruleset_engine import launch, update_rule
 from ab_platform.metrics import DEFAULT_METRICS, SYSTEM_OWNER, MetricVersion, parse_ref
 from ab_platform.schemas.passport import (
@@ -37,6 +39,14 @@ class ControlError(ValueError):
     def __init__(self, kind: str, message: str):
         self.kind = kind
         super().__init__(message)
+
+
+def invalid_text(exc: ValueError) -> str:
+    """Ошибка валидаторов простым текстом «поле: сообщение» — без служебного текста pydantic."""
+    if not isinstance(exc, ValidationError):
+        return str(exc)
+    return "; ".join(f"{'.'.join(str(x) for x in e['loc']) or 'данные'}: {e['msg'].removeprefix('Value error, ')}"
+                     for e in exc.errors())
 
 
 @dataclass(frozen=True)
@@ -182,7 +192,7 @@ class ExperimentService:
                 return Ruleset.model_validate({"version": 1, "holdout": {"pct": self._default_holdout_pct}, **changes})
             return current.next_version(**changes)
         except ValueError as exc:
-            raise ControlError("invalid", str(exc)) from exc
+            raise ControlError("invalid", invalid_text(exc)) from exc
 
     def _publish(self, new: Ruleset) -> Ruleset:
         """Сохранить версию ruleset; перед записью — сверка каждого правила с его Паспортом (LNK-1)."""
@@ -237,7 +247,7 @@ class ExperimentService:
         try:
             name, version = parse_ref(ref)
         except ValueError as exc:
-            raise ControlError("invalid", str(exc)) from exc
+            raise ControlError("invalid", invalid_text(exc)) from exc
         found = self.storage.get_metric(name, version)
         if found is None:
             raise ControlError("not_found", f"Метрики {ref} нет в реестре.")
@@ -252,7 +262,7 @@ class ExperimentService:
             try:
                 metric = MetricVersion(**data, version=latest.version + 1 if latest else 1, owner=actor.subject)
             except ValueError as exc:
-                raise ControlError("invalid", str(exc)) from exc
+                raise ControlError("invalid", invalid_text(exc)) from exc
             if latest is not None and latest.definition_hash == metric.definition_hash:
                 raise ControlError("conflict", f"Определение не отличается от {latest.ref}: новая версия не нужна.")
             self.storage.save_metric(metric)
@@ -325,7 +335,7 @@ class ExperimentService:
             try:
                 passport = ExperimentPassport(**data, version=latest.version if latest else 1)
             except ValueError as exc:
-                raise ControlError("invalid", str(exc)) from exc
+                raise ControlError("invalid", invalid_text(exc)) from exc
             self.storage.save_passport(passport)
             self.storage.append_audit(actor.subject, "passport.update" if latest else "passport.create",
                                       passport.experiment_id, {"version": passport.version})
@@ -341,7 +351,7 @@ class ExperimentService:
             try:
                 passport = latest.new_version(**changes)
             except ValueError as exc:
-                raise ControlError("invalid", str(exc)) from exc
+                raise ControlError("invalid", invalid_text(exc)) from exc
             self.storage.save_passport(passport)
             self.storage.append_audit(actor.subject, "passport.new_version", experiment_id,
                                       {"version": passport.version, "changed": sorted(changes)})
